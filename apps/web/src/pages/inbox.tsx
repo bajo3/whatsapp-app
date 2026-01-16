@@ -83,6 +83,39 @@ export function InboxPage() {
   const [sp, setSp] = useSearchParams();
   const conversationId = sp.get("c") || null;
 
+  // --- Realtime (sin refresh) ---
+  // Escucha inserts/updates de mensajes y refresca queries relevantes.
+  React.useEffect(() => {
+    // 1) Canal global para refrescar el listado cuando entra/actualiza un mensaje
+    const convListChannel = supabase
+      .channel("rt:conversations_list")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "messages" },
+        (payload) => {
+          // Refresca listado (last_message_at/unread_count) y, si aplica, el chat activo
+          qc.invalidateQueries({ queryKey: ["conversations"] });
+          const convId = (payload as any)?.new?.conversation_id || (payload as any)?.old?.conversation_id;
+          if (conversationId && convId === conversationId) {
+            qc.invalidateQueries({ queryKey: ["messages", conversationId] });
+          }
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "conversations" },
+        () => {
+          qc.invalidateQueries({ queryKey: ["conversations"] });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(convListChannel);
+    };
+    // qc es estable; conversationId cambia => re-suscribe para que invalide el chat correcto
+  }, [qc, conversationId]);
+
   const convQ = useQuery({ queryKey: ["conversations"], queryFn: fetchConversations });
   const profilesQ = useQuery({ queryKey: ["profiles"], queryFn: fetchProfiles });
   const tagsQ = useQuery({ queryKey: ["tags"], queryFn: fetchTags });
@@ -94,6 +127,26 @@ export function InboxPage() {
     queryFn: () => fetchMessages(conversationId!),
     enabled: !!conversationId,
   });
+
+  // Marcar como leída al abrir la conversación (evita que quede badge pegado)
+  React.useEffect(() => {
+    if (!conversationId) return;
+    // Fire-and-forget: si falla por RLS/no permisos, no bloquea UI
+    supabase
+      .from("conversations")
+      .update({ unread_count: 0 })
+      .eq("id", conversationId)
+      .then(() => qc.invalidateQueries({ queryKey: ["conversations"] }))
+      .catch(() => {});
+  }, [conversationId, qc]);
+
+  // Auto-scroll al final cuando llegan mensajes
+  const endRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!conversationId) return;
+    // Espera el paint
+    requestAnimationFrame(() => endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }));
+  }, [conversationId, msgsQ.data?.length]);
 
   const convTagsQ = useQuery({
     queryKey: ["conversation_tags", conversationId],
@@ -262,6 +315,7 @@ export function InboxPage() {
                   </div>
                 );
               })}
+              <div ref={endRef} />
             </div>
           )}
         </div>
