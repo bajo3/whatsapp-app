@@ -136,8 +136,11 @@ export function InboxPage() {
       .from("conversations")
       .update({ unread_count: 0 })
       .eq("id", conversationId)
-      .then(() => qc.invalidateQueries({ queryKey: ["conversations"] }))
-      .catch(() => {});
+      // Nota: Supabase devuelve PromiseLike (no siempre tiene .catch en TS). Usamos el 2do arg de .then.
+      .then(
+        () => qc.invalidateQueries({ queryKey: ["conversations"] }),
+        () => {}
+      );
   }, [conversationId, qc]);
 
   // Auto-scroll al final cuando llegan mensajes
