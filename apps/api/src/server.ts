@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import jwt from "jsonwebtoken";
 import { request } from "undici";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
@@ -20,8 +19,6 @@ const env = {
   corsOrigin: process.env.CORS_ORIGIN || "*",
   supabaseUrl: process.env.SUPABASE_URL || "",
   supabaseServiceKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
-  supabaseJwtSecret: process.env.SUPABASE_JWT_SECRET || "",
-
   metaGraphVersion: process.env.META_GRAPH_API_VERSION || "v20.0",
   waPhoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || "",
   waWabaId: process.env.WHATSAPP_WABA_ID || "",
@@ -40,12 +37,64 @@ const supabaseAdmin = createClient(env.supabaseUrl, env.supabaseServiceKey, {
 });
 
 const app = express();
-app.use(
-  cors({
-    origin: env.corsOrigin === "*" ? true : env.corsOrigin,
-    credentials: true,
-  })
-);
+
+// -----------------------------
+// CORS (robust)
+// -----------------------------
+// We reflect the request Origin only if it's explicitly allowed.
+// This prevents the classic production bug where CORS_ORIGIN was left as
+// http://localhost:5173 and blocks https://*.vercel.app.
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://whatsapp-app-web.vercel.app",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+];
+
+function buildAllowedOrigins(raw: string) {
+  const trimmed = String(raw || "").trim();
+  const parts = trimmed
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const allowAll = parts.includes("*");
+  const set = new Set<string>([...DEFAULT_ALLOWED_ORIGINS, ...parts]);
+
+  // Allow Vercel preview domains for the web project (optional but very handy).
+  const vercelWebPreview = /^https:\/\/whatsapp-app-web-[a-z0-9-]+\.vercel\.app$/i;
+
+  return {
+    allowAll,
+    set,
+    vercelWebPreview,
+    isAllowed(origin: string) {
+      if (allowAll) return true;
+      if (set.has(origin)) return true;
+      if (vercelWebPreview.test(origin)) return true;
+      return false;
+    },
+  };
+}
+
+const allowed = buildAllowedOrigins(env.corsOrigin);
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, cb) => {
+    // Non-browser requests (no Origin) -> allow.
+    if (!origin) return cb(null, true);
+    if (allowed.isAllowed(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+  maxAge: 86400,
+};
+
+app.use(cors(corsOptions));
+
+// Ensure OPTIONS preflight works for all routes (esp. when no route matches)
+app.options("*", cors(corsOptions));
 app.use(
   express.json({
     verify: (req: any, _res, buf) => {
@@ -65,12 +114,16 @@ async function authRequired(req: AuthedReq, res: express.Response, next: express
   try {
     const auth = req.headers.authorization;
     if (!auth?.startsWith("Bearer ")) return res.status(401).json({ error: "missing_bearer" });
-    if (!env.supabaseJwtSecret) return res.status(500).json({ error: "missing_SUPABASE_JWT_SECRET" });
-
     const token = auth.slice("Bearer ".length);
-    const decoded = jwt.verify(token, env.supabaseJwtSecret) as any;
-    const userId = decoded?.sub;
-    if (!userId) return res.status(401).json({ error: "invalid_jwt" });
+
+    // Supabase tokens can be HS256 (jwt_secret) or asymmetric (e.g. ES256 + JWKS).
+    // To avoid signature mismatches, we validate the token against Supabase Auth.
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+    if (userErr || !userData?.user?.id) {
+      return res.status(401).json({ error: "unauthorized", detail: userErr?.message || "invalid_token" });
+    }
+
+    const userId = userData.user.id;
 
     const { data: profile, error } = await supabaseAdmin
       .from("profiles")
