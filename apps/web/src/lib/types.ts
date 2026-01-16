@@ -7,6 +7,7 @@ export type Contact = {
   name: string | null;
   phone_e164: string;
   last_seen_at: string | null;
+  last_seen_by_agent_at?: string | null;
 };
 
 export type Conversation = {

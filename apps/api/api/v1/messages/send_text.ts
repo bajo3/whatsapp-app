@@ -73,8 +73,8 @@ export default async function handler(req: any, res: any) {
     const phoneNumberId = await resolvePhoneNumberId(auth.dealershipId);
     if (!phoneNumberId) return res.status(500).json({ error: "missing_phone_number_id" });
 
-    // 2) insertar mensaje “queued”
-    const msgInsertUrl = `${env.supabaseUrl}/rest/v1/messages?select=id`;
+    // 2) insertar mensaje “queued” (devolvemos representación para reconciliar con optimistic UI)
+    const msgInsertUrl = `${env.supabaseUrl}/rest/v1/messages?select=id,conversation_id,direction,type,text_body,status,wa_message_id,created_at`;
     const msgInsertRes = await fetch(msgInsertUrl, {
       method: "POST",
       headers: {
@@ -93,12 +93,24 @@ export default async function handler(req: any, res: any) {
     });
 
     const inserted = await msgInsertRes.json();
-    const msgId = inserted?.[0]?.id;
+    const insertedRow = inserted?.[0];
+    const msgId = insertedRow?.id;
     if (!msgId) throw new Error(`db_insert_message_failed: ${JSON.stringify(inserted)}`);
 
     // 3) enviar a WhatsApp
-    const waRes = await sendWhatsAppText(phoneNumberId, to, text);
-    const waMessageId = waRes?.messages?.[0]?.id || null;
+    let waMessageId: string | null = null;
+    try {
+      const waRes = await sendWhatsAppText(phoneNumberId, to, text);
+      waMessageId = waRes?.messages?.[0]?.id || null;
+    } catch (err: any) {
+      // Si WhatsApp falla, marcamos failed para que el front ofrezca “Reintentar”
+      await fetch(`${env.supabaseUrl}/rest/v1/messages?id=eq.${msgId}`, {
+        method: "PATCH",
+        headers: supabaseHeaders(),
+        body: JSON.stringify({ status: "failed" }),
+      });
+      return res.status(502).json({ error: "whatsapp_send_failed", detail: err?.message || String(err), message_id: msgId });
+    }
 
     // 4) actualizar mensaje + conversación
     await fetch(`${env.supabaseUrl}/rest/v1/messages?id=eq.${msgId}`, {
@@ -113,7 +125,13 @@ export default async function handler(req: any, res: any) {
       body: JSON.stringify({ last_message_at: new Date().toISOString() }),
     });
 
-    return res.status(200).json({ ok: true, wa_message_id: waMessageId });
+    return res.status(200).json({
+      ok: true,
+      message_id: msgId,
+      created_at: insertedRow?.created_at ?? new Date().toISOString(),
+      status: "sent",
+      wa_message_id: waMessageId,
+    });
   } catch (e: any) {
     return res.status(400).json({ error: "send_text_error", detail: e?.message || String(e) });
   }
