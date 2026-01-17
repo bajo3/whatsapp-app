@@ -228,7 +228,7 @@ app.post("/v1/wa/webhook", async (req: AuthedReq, res) => {
       // Find or create conversation
       const { data: existingConv, error: convFindErr } = await supabaseAdmin
         .from("conversations")
-        .select("id,unread_count")
+        .select("id,unread_count,assigned_to")
         .eq("dealership_id", dealershipId)
         .eq("contact_id", contact.id)
         .maybeSingle();
@@ -245,10 +245,18 @@ app.post("/v1/wa/webhook", async (req: AuthedReq, res) => {
             unread_count: 1,
             last_message_at: ts,
           })
-          .select("id")
+          .select("id,assigned_to")
           .single();
         if (convInsErr) throw new Error(`conv_insert: ${convInsErr.message}`);
         conversationId = newConv.id;
+
+        // Auto-assign on first inbound conversation creation
+        if (!newConv.assigned_to) {
+          const assignee = await pickAutoAssignee(dealershipId, phone_e164);
+          if (assignee) {
+            await supabaseAdmin.from("conversations").update({ assigned_to: assignee }).eq("id", conversationId);
+          }
+        }
       } else {
         const unread = (existingConv?.unread_count || 0) + 1;
         const { error: convUpdErr } = await supabaseAdmin
@@ -256,6 +264,14 @@ app.post("/v1/wa/webhook", async (req: AuthedReq, res) => {
           .update({ unread_count: unread, last_message_at: ts })
           .eq("id", conversationId);
         if (convUpdErr) throw new Error(`conv_update: ${convUpdErr.message}`);
+
+        // Auto-assign if unassigned and a new inbound message arrives
+        if (!existingConv?.assigned_to) {
+          const assignee = await pickAutoAssignee(dealershipId, phone_e164);
+          if (assignee) {
+            await supabaseAdmin.from("conversations").update({ assigned_to: assignee }).eq("id", conversationId);
+          }
+        }
       }
 
       // Insert message
@@ -331,7 +347,7 @@ app.post("/v1/messages/send_text", authRequired, async (req: AuthedReq, res) => 
         status: "queued",
         created_by: userId,
       })
-      .select("id")
+      .select("id,created_at")
       .single();
     if (msgInsErr) throw new Error(msgInsErr.message);
 
@@ -352,7 +368,7 @@ app.post("/v1/messages/send_text", authRequired, async (req: AuthedReq, res) => 
     // Update conversation last_message_at
     await supabaseAdmin.from("conversations").update({ last_message_at: new Date().toISOString() }).eq("id", conversation_id);
 
-    res.json({ ok: true, wa_message_id: waMessageId });
+    res.json({ ok: true, message_id: msgRow.id, created_at: msgRow.created_at, status: "sent", wa_message_id: waMessageId });
   } catch (e: any) {
     res.status(400).json({ error: "send_text_error", detail: e?.message || String(e) });
   }
@@ -404,7 +420,7 @@ app.post("/v1/messages/send_template", authRequired, async (req: AuthedReq, res)
         created_by: userId,
         payload: { template_name, language, body_vars },
       })
-      .select("id")
+      .select("id,created_at")
       .single();
     if (msgInsErr) throw new Error(msgInsErr.message);
 
@@ -423,7 +439,7 @@ app.post("/v1/messages/send_template", authRequired, async (req: AuthedReq, res)
     await supabaseAdmin.from("messages").update({ status: "sent", wa_message_id: waMessageId }).eq("id", msgRow.id);
     await supabaseAdmin.from("conversations").update({ last_message_at: new Date().toISOString() }).eq("id", conversation_id);
 
-    res.json({ ok: true, wa_message_id: waMessageId });
+    res.json({ ok: true, message_id: msgRow.id, created_at: msgRow.created_at, status: "sent", wa_message_id: waMessageId });
   } catch (e: any) {
     res.status(400).json({ error: "send_template_error", detail: e?.message || String(e) });
   }
@@ -466,7 +482,7 @@ app.post("/v1/messages/send_flow", authRequired, async (req: AuthedReq, res) => 
         created_by: userId,
         payload: { flow_id, cta_text, body_text },
       })
-      .select("id")
+      .select("id,created_at")
       .single();
     if (msgInsErr) throw new Error(msgInsErr.message);
 
@@ -494,7 +510,7 @@ app.post("/v1/messages/send_flow", authRequired, async (req: AuthedReq, res) => 
     await supabaseAdmin.from("messages").update({ status: "sent", wa_message_id: waMessageId }).eq("id", msgRow.id);
     await supabaseAdmin.from("conversations").update({ last_message_at: new Date().toISOString() }).eq("id", conversation_id);
 
-    res.json({ ok: true, wa_message_id: waMessageId });
+    res.json({ ok: true, message_id: msgRow.id, created_at: msgRow.created_at, status: "sent", wa_message_id: waMessageId });
   } catch (e: any) {
     res.status(400).json({ error: "send_flow_error", detail: e?.message || String(e) });
   }
@@ -517,7 +533,7 @@ app.post("/v1/ai/suggest_reply", authRequired, async (req: AuthedReq, res) => {
 
     const { data: msgs, error: mErr } = await supabaseAdmin
       .from("messages")
-      .select("direction, body, created_at")
+      .select("direction, text_body, created_at")
       .eq("conversation_id", body.conversation_id)
       .order("created_at", { ascending: true })
       .limit(30);
@@ -542,7 +558,7 @@ app.post("/v1/ai/suggest_reply", authRequired, async (req: AuthedReq, res) => {
     const transcript = (msgs || [])
       .map((m: any) => {
         const who = m.direction === "out" ? "Vendedor" : "Cliente";
-        return `${who}: ${String(m.body || "").trim()}`;
+        return `${who}: ${String(m.text_body || "").trim()}`;
       })
       .filter(Boolean)
       .join("\n");
@@ -583,6 +599,158 @@ app.post("/v1/ai/suggest_reply", authRequired, async (req: AuthedReq, res) => {
     return res.status(400).json({ ok: false, error: e?.message || "Bad request" });
   }
 });
+
+// AI: analyze conversation -> summary, intent, objections, next steps (and store in conversations.ai_meta)
+app.post("/v1/ai/analyze_conversation", authRequired, async (req: AuthedReq, res) => {
+  try {
+    const body = z.object({ conversation_id: z.string().uuid() }).parse(req.body);
+    if (!env.openaiApiKey) return res.status(501).json({ ok: false, error: "OPENAI_API_KEY not set" });
+
+    const { dealershipId } = req.auth!;
+
+    const { data: conv, error: cErr } = await supabaseAdmin
+      .from("conversations")
+      .select("id,contact_id,lead_stage,lead_source")
+      .eq("id", body.conversation_id)
+      .eq("dealership_id", dealershipId)
+      .maybeSingle();
+    if (cErr || !conv) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+
+    const { data: contact } = await supabaseAdmin
+      .from("contacts")
+      .select("name,phone_e164")
+      .eq("id", conv.contact_id)
+      .maybeSingle();
+
+    const { data: msgs, error: mErr } = await supabaseAdmin
+      .from("messages")
+      .select("direction,text_body,created_at")
+      .eq("conversation_id", body.conversation_id)
+      .order("created_at", { ascending: true })
+      .limit(60);
+    if (mErr) throw mErr;
+
+    const transcript = (msgs || [])
+      .map((m: any) => {
+        const who = m.direction === "out" ? "Vendedor" : "Cliente";
+        const t = String(m.text_body || "").trim();
+        return t ? `${who}: ${t}` : "";
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    const contactLine = contact ? `Contacto: ${contact.name || "(sin nombre)"} — ${contact.phone_e164}` : "";
+
+    const prompt = `Sos un asistente comercial para una agencia de autos en Argentina.
+Analizá el chat y devolvé SOLO JSON válido con estas claves:
+summary (string corta),
+intent (string: qué busca el cliente),
+objections (array de strings),
+next_steps (array de strings accionables),
+recommended_stage (one of: new, contacted, visited, reserved, sold, lost).
+
+Reglas:
+- No inventes datos.
+- Máximo: summary 2-3 líneas.
+- next_steps: 3 a 6 items.
+
+${contactLine}
+
+Chat:
+${transcript}
+`;
+
+    const { statusCode, body: respBody } = await request("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.openaiApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: env.openaiModel,
+        input: prompt,
+        max_output_tokens: 400,
+      }),
+    });
+
+    const raw = await respBody.text();
+    if (statusCode < 200 || statusCode >= 300) {
+      return res.status(500).json({ ok: false, error: `OpenAI error ${statusCode}: ${raw}` });
+    }
+
+    let outText = "";
+    try {
+      const json = JSON.parse(raw);
+      outText = String(json.output_text || json?.output?.[0]?.content?.[0]?.text || raw);
+    } catch {
+      outText = raw;
+    }
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(outText);
+    } catch {
+      // try to extract a JSON block
+      const m = outText.match(/\{[\s\S]*\}/);
+      if (m) parsed = JSON.parse(m[0]);
+    }
+
+    const ResultSchema = z.object({
+      summary: z.string().default(""),
+      intent: z.string().default(""),
+      objections: z.array(z.string()).default([]),
+      next_steps: z.array(z.string()).default([]),
+      recommended_stage: z.enum(["new", "contacted", "visited", "reserved", "sold", "lost"]).default("contacted"),
+    });
+    const result = ResultSchema.parse(parsed || {});
+
+    const ai_meta = {
+      summary: result.summary,
+      intent: result.intent,
+      objections: result.objections,
+      next_steps: result.next_steps,
+      recommended_stage: result.recommended_stage,
+      updated_at: new Date().toISOString(),
+    };
+
+    await supabaseAdmin
+      .from("conversations")
+      .update({ ai_meta })
+      .eq("id", body.conversation_id)
+      .eq("dealership_id", dealershipId);
+
+    return res.json({ ok: true, ai_meta });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || "Bad request" });
+  }
+});
+
+// -----------------------------
+// Auto-assign helper (deterministic by phone)
+// -----------------------------
+function hashStringToInt(str: string): number {
+  // simple djb2
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) + str.charCodeAt(i);
+    h |= 0;
+  }
+  return Math.abs(h);
+}
+
+async function pickAutoAssignee(dealershipId: string, phoneE164: string): Promise<string | null> {
+  const { data, error } = await supabaseAdmin
+    .from("profiles")
+    .select("id,role")
+    .eq("dealership_id", dealershipId);
+  if (error) return null;
+
+  const sellers = (data || []).filter((p: any) => p.role === "seller" || p.role === "manager" || p.role === "admin");
+  if (!sellers.length) return null;
+
+  const idx = hashStringToInt(phoneE164) % sellers.length;
+  return String(sellers[idx].id);
+}
 
 async function resolvePhoneNumberId(dealershipId: string): Promise<string | null> {
   const { data } = await supabaseAdmin

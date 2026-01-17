@@ -3,6 +3,7 @@ import { createBrowserRouter, redirect } from "react-router-dom";
 import { RootLayout } from "./root-layout";
 import { LoginPage } from "../pages/login";
 import { InboxPage } from "../pages/inbox";
+import { ContactsPage } from "../pages/contacts";
 import { SettingsPage } from "../pages/settings";
 import { requireSession } from "../lib/session";
 
@@ -21,6 +22,7 @@ export const router = createBrowserRouter([
     },
     children: [
       { index: true, element: <InboxPage /> },
+      { path: "contacts", element: <ContactsPage /> },
       { path: "settings", element: <SettingsPage /> },
     ],
   },

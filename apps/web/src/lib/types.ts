@@ -8,6 +8,11 @@ export type Contact = {
   phone_e164: string;
   last_seen_at: string | null;
   last_seen_by_agent_at?: string | null;
+  email?: string | null;
+  doc_id?: string | null;
+  address?: string | null;
+  notes?: string | null;
+  lead_source?: "ig" | "ml" | "referral" | "web" | "walkin" | "other" | null;
 };
 
 export type Conversation = {
@@ -15,6 +20,9 @@ export type Conversation = {
   contact_id: string;
   status: ConversationStatus;
   assigned_to: string | null;
+  lead_stage?: "new" | "contacted" | "visited" | "reserved" | "sold" | "lost";
+  lead_source?: "ig" | "ml" | "referral" | "web" | "walkin" | "other" | null;
+  ai_meta?: any;
   last_message_at: string | null;
   unread_count: number;
   contact?: Contact;

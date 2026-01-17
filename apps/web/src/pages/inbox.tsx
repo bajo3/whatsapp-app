@@ -3,31 +3,34 @@ import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNowStrict } from "date-fns";
 import {
-  Bell,
   Check,
   CheckCheck,
   ChevronLeft,
-  Filter,
+  Info,
   Loader2,
-  MoreVertical,
+  Bookmark,
+  FileText,
+  MessageSquarePlus,
   Phone,
   Search,
   Send,
   Sparkles,
-  Tag as TagIcon,
-  UserPlus,
+  User,
   X,
-  StickyNote,
-  Clock,
-  Zap,
 } from "lucide-react";
 
 import { supabase } from "../lib/supabase";
 import { apiPost } from "../lib/api";
 import { useSession } from "../lib/hooks";
-import type { Conversation, Followup, Message, ProfileMini, Tag } from "../lib/types";
+import type { Contact, Conversation, Message } from "../lib/types";
 
-type QuickReply = { id: string; title: string; body: string };
+type Followup = {
+  id: string;
+  conversation_id: string;
+  due_at: string;
+  status: "pending" | "done" | "canceled";
+  reason: string | null;
+};
 
 type Note = {
   id: string;
@@ -37,6 +40,8 @@ type Note = {
   created_by: string | null;
 };
 
+type InboxFilter = "all" | "mine" | "unassigned" | "unread";
+
 type SendTextResponse = {
   ok: boolean;
   message_id?: string;
@@ -45,49 +50,79 @@ type SendTextResponse = {
   wa_message_id?: string | null;
 };
 
-function safeJsonParse(s: string): any | null {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
+function cx(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
 }
 
 function friendlyError(e: any): string {
   const raw = String(e?.message || e || "").trim();
-  // apiPost tira text; a veces es JSON
-  const json = safeJsonParse(raw);
-  if (json?.detail) return String(json.detail);
-  if (json?.error && typeof json.error === "string") return json.error;
   if (/failed to fetch/i.test(raw)) return "No se pudo conectar. Revisá tu internet y reintentá.";
   return raw || "Ocurrió un error";
 }
 
+function normalizePhoneE164(raw: string): string {
+  const s = raw.replace(/\s+/g, "").replace(/\-/g, "");
+  if (s.startsWith("+")) return s;
+  if (/^\d{6,}$/.test(s)) return `+54${s}`;
+  return s;
+}
+
+function StatusTicks({ status }: { status: Message["status"] }) {
+  if (status === "sent") return <Check size={14} className="text-[var(--wa-subtext)]" />;
+  if (status === "delivered") return <CheckCheck size={14} className="text-[var(--wa-subtext)]" />;
+  if (status === "read") return <CheckCheck size={14} className="text-sky-500" />;
+  return null;
+}
+
+const STAGE_LABEL: Record<string, string> = {
+  new: "Nuevo",
+  contacted: "Contactado",
+  visited: "Visitó",
+  reserved: "Reservado",
+  sold: "Vendido",
+  lost: "Perdido",
+};
+
+const SOURCE_LABEL: Record<string, string> = {
+  ig: "Instagram",
+  ml: "MercadoLibre",
+  referral: "Referido",
+  web: "Web",
+  walkin: "Mostrador",
+  other: "Otro",
+};
+
+function stageBadgeClass(stage?: string | null) {
+  const s = stage || "new";
+  if (s === "sold") return "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300";
+  if (s === "reserved") return "bg-amber-500/15 text-amber-700 dark:text-amber-300";
+  if (s === "visited") return "bg-sky-500/15 text-sky-700 dark:text-sky-300";
+  if (s === "contacted") return "bg-[var(--wa-accent)]/15 text-[var(--wa-accent)]";
+  if (s === "lost") return "bg-rose-500/15 text-rose-700 dark:text-rose-300";
+  return "bg-black/5 dark:bg-white/10 text-[var(--wa-text)]";
+}
+
 async function fetchConversations(): Promise<Conversation[]> {
-  const selectBase = "id,contact_id,status,assigned_to,last_message_at,unread_count,contact:contact_id(id,name,phone_e164,last_seen_at)";
-  const selectWithAgent = `${selectBase.slice(0, -1)},last_seen_by_agent_at)`;
-
-  // Compat: si todavía no corriste la migración 002 (columna nueva), hacemos fallback.
-  const first = await supabase
+  const { data, error } = await supabase
     .from("conversations")
-    .select(selectWithAgent)
+    .select(
+      "id,contact_id,status,assigned_to,lead_stage,lead_source,ai_meta,last_message_at,unread_count,contact:contact_id(id,name,phone_e164,last_seen_at,last_seen_by_agent_at,lead_source,email,doc_id,address,notes)"
+    )
     .order("last_message_at", { ascending: false, nullsFirst: false })
-    .limit(400);
+    .limit(500);
 
-  if (!first.error) return (first.data ?? []) as any;
+  if (!error) return (data ?? []) as any;
 
-  const msg = String((first.error as any)?.message || "");
-  if (/last_seen_by_agent_at/i.test(msg) || /column/i.test(msg)) {
-    const second = await supabase
-      .from("conversations")
-      .select(selectBase)
-      .order("last_message_at", { ascending: false, nullsFirst: false })
-      .limit(400);
-    if (second.error) throw second.error;
-    return (second.data ?? []) as any;
-  }
-
-  throw first.error;
+  // compat: si faltan columnas nuevas
+  const { data: d2, error: e2 } = await supabase
+    .from("conversations")
+    .select(
+      "id,contact_id,status,assigned_to,last_message_at,unread_count,contact:contact_id(id,name,phone_e164,last_seen_at)"
+    )
+    .order("last_message_at", { ascending: false, nullsFirst: false })
+    .limit(500);
+  if (e2) throw e2;
+  return (d2 ?? []) as any;
 }
 
 async function fetchMessages(conversationId: string): Promise<Message[]> {
@@ -96,45 +131,9 @@ async function fetchMessages(conversationId: string): Promise<Message[]> {
     .select("id,conversation_id,direction,type,text_body,status,wa_message_id,created_at")
     .eq("conversation_id", conversationId)
     .order("created_at", { ascending: true })
-    .limit(800);
+    .limit(900);
   if (error) throw error;
   return (data ?? []) as any;
-}
-
-async function fetchProfiles(): Promise<ProfileMini[]> {
-  const { data, error } = await supabase.from("profiles").select("id,full_name,role").order("full_name", { ascending: true });
-  if (error) throw error;
-  return (data ?? []) as any;
-}
-
-async function fetchTags(): Promise<Tag[]> {
-  const { data, error } = await supabase.from("tags").select("id,name").order("name", { ascending: true });
-  if (error) throw error;
-  return (data ?? []) as any;
-}
-
-async function fetchQuickReplies(): Promise<QuickReply[]> {
-  const { data, error } = await supabase.from("quick_replies").select("id,title,body").order("title", { ascending: true });
-  if (error) throw error;
-  return (data ?? []) as any;
-}
-
-function useMediaQuery(query: string) {
-  const [matches, setMatches] = React.useState(false);
-  React.useEffect(() => {
-    const mq = window.matchMedia(query);
-    const onChange = () => setMatches(mq.matches);
-    onChange();
-    mq.addEventListener?.("change", onChange);
-    return () => mq.removeEventListener?.("change", onChange);
-  }, [query]);
-  return matches;
-}
-
-async function fetchConversationTags(conversationId: string): Promise<string[]> {
-  const { data, error } = await supabase.from("conversation_tags").select("tag_id").eq("conversation_id", conversationId);
-  if (error) throw error;
-  return (data ?? []).map((r: any) => r.tag_id);
 }
 
 async function fetchFollowups(conversationId: string): Promise<Followup[]> {
@@ -144,19 +143,6 @@ async function fetchFollowups(conversationId: string): Promise<Followup[]> {
     .eq("conversation_id", conversationId)
     .order("due_at", { ascending: true })
     .limit(200);
-  if (error) throw error;
-  return (data ?? []) as any;
-}
-
-async function fetchDueFollowups(): Promise<(Followup & { conversation_id: string })[]> {
-  const nowIso = new Date().toISOString();
-  const { data, error } = await supabase
-    .from("followups")
-    .select("id,conversation_id,due_at,status,reason")
-    .eq("status", "pending")
-    .lte("due_at", nowIso)
-    .order("due_at", { ascending: true })
-    .limit(50);
   if (error) throw error;
   return (data ?? []) as any;
 }
@@ -172,197 +158,651 @@ async function fetchNotes(conversationId: string): Promise<Note[]> {
   return (data ?? []) as any;
 }
 
-function Pill({ active, onClick, children }: { active?: boolean; onClick?: () => void; children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`inline-flex items-center rounded-full border px-3 py-1 text-xs transition ${
-        active ? "bg-slate-900 text-white border-slate-900" : "bg-white hover:bg-slate-50"
-      }`}
-    >
-      {children}
-    </button>
-  );
+type TagRow = { id: string; name: string };
+type ConversationTagRow = { tag_id: string; tag: TagRow };
+
+async function fetchProfiles(): Promise<{ id: string; full_name: string | null; role: string }[]> {
+  const { data, error } = await supabase.from("profiles").select("id,full_name,role").order("full_name");
+  if (error) throw error;
+  return (data ?? []) as any;
 }
 
-function SectionTitle({ icon, title, right }: { icon: React.ReactNode; title: string; right?: React.ReactNode }) {
+async function fetchTags(): Promise<TagRow[]> {
+  const { data, error } = await supabase.from("tags").select("id,name").order("name");
+  if (error) throw error;
+  return (data ?? []) as any;
+}
+
+async function fetchConversationTags(conversationId: string): Promise<ConversationTagRow[]> {
+  const { data, error } = await supabase
+    .from("conversation_tags")
+    .select("tag_id,tag:tag_id(id,name)")
+    .eq("conversation_id", conversationId)
+    .order("created_at", { ascending: true })
+    .limit(50);
+  if (error) throw error;
+  return (data ?? []) as any;
+}
+
+async function fetchQuickReplies(): Promise<{ id: string; title: string; body: string }[]> {
+  const { data, error } = await supabase.from("quick_replies").select("id,title,body").order("title");
+  if (error) throw error;
+  return (data ?? []) as any;
+}
+
+async function fetchTemplates(): Promise<{ id: string; name: string; language: string; components: any }[]> {
+  const { data, error } = await supabase.from("wa_templates").select("id,name,language,components").order("name");
+  if (error) throw error;
+  return (data ?? []) as any;
+}
+
+async function searchContacts(q: string): Promise<Contact[]> {
+  const like = `%${q.trim()}%`;
+  const base = supabase
+    .from("contacts")
+    .select("id,name,phone_e164,last_seen_at,last_seen_by_agent_at")
+    .order("created_at", { ascending: false })
+    .limit(50);
+
+  if (!q.trim()) {
+    const { data, error } = await base;
+    if (!error) return (data ?? []) as any;
+    const { data: d2, error: e2 } = await supabase
+      .from("contacts")
+      .select("id,name,phone_e164,last_seen_at")
+      .order("created_at", { ascending: false })
+      .limit(50);
+    if (e2) throw e2;
+    return (d2 ?? []) as any;
+  }
+
+  const { data, error } = await base.or(`name.ilike.${like},phone_e164.ilike.${like}`);
+  if (!error) return (data ?? []) as any;
+  const { data: d2, error: e2 } = await supabase
+    .from("contacts")
+    .select("id,name,phone_e164,last_seen_at")
+    .or(`name.ilike.${like},phone_e164.ilike.${like}`)
+    .order("created_at", { ascending: false })
+    .limit(50);
+  if (e2) throw e2;
+  return (d2 ?? []) as any;
+}
+
+async function getOrCreateConversationForContact(contactId: string): Promise<string> {
+  const { data: existing, error: e1 } = await supabase
+    .from("conversations")
+    .select("id")
+    .eq("contact_id", contactId)
+    .limit(1);
+  if (e1) throw e1;
+  if (existing?.[0]?.id) return String(existing[0].id);
+
+  const { data, error } = await supabase.from("conversations").insert({ contact_id: contactId }).select("id").limit(1);
+  if (error) throw error;
+  return String(data?.[0]?.id);
+}
+
+async function getOrCreateContactByPhone(phoneRaw: string, name?: string): Promise<Contact> {
+  const phone = normalizePhoneE164(phoneRaw);
+  const { data: rows, error } = await supabase.from("contacts").select("id,name,phone_e164,last_seen_at").eq("phone_e164", phone).limit(1);
+  if (error) throw error;
+  if (rows?.[0]) return rows[0] as any;
+  const { data, error: e2 } = await supabase
+    .from("contacts")
+    .insert({ phone_e164: phone, name: name?.trim() || null })
+    .select("id,name,phone_e164,last_seen_at")
+    .limit(1);
+  if (e2) throw e2;
+  return (data?.[0] as any) as Contact;
+}
+
+function useIsMobile() {
+  const [m, setM] = React.useState(false);
+  React.useEffect(() => {
+    const mq = window.matchMedia("(max-width: 768px)");
+    const on = () => setM(mq.matches);
+    on();
+    mq.addEventListener?.("change", on);
+    return () => mq.removeEventListener?.("change", on);
+  }, []);
+  return m;
+}
+
+function Dialog({ open, title, onClose, children }: { open: boolean; title: string; onClose: () => void; children: React.ReactNode }) {
+  if (!open) return null;
   return (
-    <div className="flex items-center justify-between gap-2">
-      <div className="flex items-center gap-2 text-xs font-semibold text-slate-600 uppercase tracking-wide">
-        {icon}
-        <span>{title}</span>
+    <div className="fixed inset-0 z-50">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="absolute inset-x-0 top-10 mx-auto w-[92vw] max-w-lg">
+        <div className="rounded-2xl border border-[var(--wa-border)] bg-[var(--wa-panel)] shadow-xl">
+          <div className="px-4 py-3 border-b border-[var(--wa-border)] bg-[var(--wa-header)] rounded-t-2xl flex items-center justify-between">
+            <div className="font-semibold">{title}</div>
+            <button
+              type="button"
+              className="h-9 w-9 rounded-xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center"
+              onClick={onClose}
+              aria-label="Cerrar"
+            >
+              <X size={18} />
+            </button>
+          </div>
+          <div className="p-4">{children}</div>
+        </div>
       </div>
-      {right}
     </div>
   );
 }
 
-function StatusIcon({ status }: { status: Message["status"] }) {
-  if (status === "sent") return <Check size={14} className="inline-block" />;
-  if (status === "delivered") return <CheckCheck size={14} className="inline-block" />;
-  if (status === "read") return <CheckCheck size={14} className="inline-block" />;
-  return null;
-}
-
-function upsertConversationInList(list: Conversation[] | undefined, patch: Partial<Conversation> & { id: string }): Conversation[] {
-  const arr = Array.isArray(list) ? [...list] : [];
-  const idx = arr.findIndex((c) => c.id === patch.id);
-  if (idx >= 0) {
-    arr[idx] = { ...arr[idx], ...patch } as any;
-  } else {
-    // Si no lo tenemos, forzamos refetch luego; esto mantiene UI estable
-    arr.unshift(patch as any);
-  }
-  // ordenar por last_message_at desc
-  arr.sort((a, b) => {
-    const ta = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
-    const tb = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
-    return tb - ta;
-  });
-  return arr;
-}
-
 export function InboxPage() {
+  useSession();
+  const isMobile = useIsMobile();
   const qc = useQueryClient();
-  const { user } = useSession();
   const [sp, setSp] = useSearchParams();
-  const conversationId = sp.get("c") || null;
+  const selectedId = sp.get("c") || "";
 
-  // Responsive helpers
-  const isSmall = useMediaQuery("(max-width: 767px)");
-  const isNarrow = useMediaQuery("(max-width: 1023px)");
-
-  React.useEffect(() => {
-    if (!isNarrow) setDetailsOpen(false);
-  }, [isNarrow]);
-
-  // UI state
-  const [search, setSearch] = React.useState("");
-  const [filter, setFilter] = React.useState<"all" | "mine" | "unassigned" | "unread">("all");
+  const [filter, setFilter] = React.useState<InboxFilter>("all");
+  const [q, setQ] = React.useState("");
+  const [composer, setComposer] = React.useState("");
   const [detailsOpen, setDetailsOpen] = React.useState(false);
-  const [qrOpen, setQrOpen] = React.useState(false);
-  const [aiOpen, setAiOpen] = React.useState(false);
 
-  // --- Queries ---
-  const convQ = useQuery({
+  const [newChatOpen, setNewChatOpen] = React.useState(false);
+  const [newChatQuery, setNewChatQuery] = React.useState("");
+  const [newChatName, setNewChatName] = React.useState("");
+  const [newChatPhone, setNewChatPhone] = React.useState("");
+
+  const [noteBody, setNoteBody] = React.useState("");
+  const [followupReason, setFollowupReason] = React.useState("");
+
+  const [qrPickerOpen, setQrPickerOpen] = React.useState(false);
+  const [qrSearch, setQrSearch] = React.useState("");
+  const [tplPickerOpen, setTplPickerOpen] = React.useState(false);
+  const [tplVars, setTplVars] = React.useState("");
+  const [tplSelected, setTplSelected] = React.useState<{ name: string; language: string } | null>(null);
+
+  const [aiLoading, setAiLoading] = React.useState(false);
+
+  const me = (qc.getQueryData(["me"]) as any) || null;
+
+  const conversationsQ = useQuery({
     queryKey: ["conversations"],
     queryFn: fetchConversations,
-    // fallback suave (aunque realtime falle, nunca requiere refresh)
-    refetchInterval: 15000,
-  });
-  const profilesQ = useQuery({ queryKey: ["profiles"], queryFn: fetchProfiles });
-  const tagsQ = useQuery({ queryKey: ["tags"], queryFn: fetchTags });
-  const quickRepliesQ = useQuery({ queryKey: ["quick_replies"], queryFn: fetchQuickReplies });
-  const dueFupsQ = useQuery({
-    queryKey: ["due_followups"],
-    queryFn: fetchDueFollowups,
-    refetchInterval: 20000,
+    staleTime: 6_000,
+    refetchInterval: 15_000,
   });
 
-  const activeConv = React.useMemo(
-    () => convQ.data?.find((c) => c.id === conversationId) ?? null,
-    [convQ.data, conversationId]
-  );
-
-  const msgsQ = useQuery({
-    queryKey: ["messages", conversationId],
-    queryFn: () => fetchMessages(conversationId!),
-    enabled: !!conversationId,
-    refetchInterval: conversationId ? 8000 : false,
-  });
-
-  const convTagsQ = useQuery({
-    queryKey: ["conversation_tags", conversationId],
-    queryFn: () => fetchConversationTags(conversationId!),
-    enabled: !!conversationId,
+  const messagesQ = useQuery({
+    queryKey: ["messages", selectedId],
+    queryFn: () => fetchMessages(selectedId),
+    enabled: Boolean(selectedId),
+    staleTime: 5_000,
+    refetchInterval: selectedId ? 8_000 : false,
   });
 
   const followupsQ = useQuery({
-    queryKey: ["followups", conversationId],
-    queryFn: () => fetchFollowups(conversationId!),
-    enabled: !!conversationId,
+    queryKey: ["followups", selectedId],
+    queryFn: () => fetchFollowups(selectedId),
+    enabled: Boolean(selectedId) && detailsOpen,
+    staleTime: 5_000,
   });
 
   const notesQ = useQuery({
-    queryKey: ["notes", conversationId],
-    queryFn: () => fetchNotes(conversationId!),
-    enabled: !!conversationId,
+    queryKey: ["notes", selectedId],
+    queryFn: () => fetchNotes(selectedId),
+    enabled: Boolean(selectedId) && detailsOpen,
+    staleTime: 5_000,
   });
 
-  // --- Realtime: append/patch en memoria (sin invalidate masivo) ---
+  const profilesQ = useQuery({
+    queryKey: ["profiles_mini"],
+    queryFn: fetchProfiles,
+    staleTime: 60_000,
+  });
+
+  const tagsQ = useQuery({
+    queryKey: ["tags"],
+    queryFn: fetchTags,
+    staleTime: 60_000,
+  });
+
+  const convTagsQ = useQuery({
+    queryKey: ["conversation_tags", selectedId],
+    queryFn: () => fetchConversationTags(selectedId),
+    enabled: Boolean(selectedId),
+    staleTime: 15_000,
+  });
+
+  const quickRepliesQ = useQuery({
+    queryKey: ["quick_replies"],
+    queryFn: fetchQuickReplies,
+    staleTime: 60_000,
+  });
+
+  const templatesQ = useQuery({
+    queryKey: ["wa_templates"],
+    queryFn: fetchTemplates,
+    staleTime: 60_000,
+  });
+
+  const visibleConversations = React.useMemo(() => {
+    const list = conversationsQ.data ?? [];
+    const qn = q.trim().toLowerCase();
+    const mineId = me?.id ? String(me.id) : "";
+    return list
+      .filter((c) => {
+        if (filter === "mine" && mineId) return c.assigned_to === mineId;
+        if (filter === "unassigned") return !c.assigned_to;
+        if (filter === "unread") return (c.unread_count ?? 0) > 0;
+        return true;
+      })
+      .filter((c) => {
+        if (!qn) return true;
+        const name = (c.contact?.name || "").toLowerCase();
+        const phone = (c.contact?.phone_e164 || "").toLowerCase();
+        return name.includes(qn) || phone.includes(qn);
+      });
+  }, [conversationsQ.data, filter, q, me?.id]);
+
+  const selectedConversation = React.useMemo(
+    () => (conversationsQ.data ?? []).find((c) => c.id === selectedId) || null,
+    [conversationsQ.data, selectedId]
+  );
+
+  function patchConversationInCache(convId: string, patch: Partial<Conversation>) {
+    qc.setQueryData(["conversations"], (old: any) => {
+      const arr = Array.isArray(old) ? [...old] : [];
+      const i = arr.findIndex((x: Conversation) => x.id === convId);
+      if (i >= 0) arr[i] = { ...arr[i], ...patch };
+      return arr;
+    });
+  }
+
+  const setStageMut = useMutation({
+    mutationFn: async (lead_stage: Conversation["lead_stage"]) => {
+      if (!selectedId) throw new Error("no_conversation");
+      const { error } = await supabase.from("conversations").update({ lead_stage } as any).eq("id", selectedId);
+      if (error) throw error;
+      return lead_stage;
+    },
+    onMutate: async (lead_stage) => {
+      if (!selectedId) return;
+      patchConversationInCache(selectedId, { lead_stage } as any);
+    },
+    onError: () => {
+      qc.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+
+  const setSourceMut = useMutation({
+    mutationFn: async (lead_source: Conversation["lead_source"]) => {
+      if (!selectedId) throw new Error("no_conversation");
+      const { error } = await supabase.from("conversations").update({ lead_source } as any).eq("id", selectedId);
+      if (error) throw error;
+      // mirror on contact when possible
+      const contactId = selectedConversation?.contact_id;
+      if (contactId) {
+        await supabase.from("contacts").update({ lead_source } as any).eq("id", contactId);
+      }
+      return lead_source;
+    },
+    onMutate: async (lead_source) => {
+      if (!selectedId) return;
+      patchConversationInCache(selectedId, { lead_source } as any);
+    },
+    onError: () => {
+      qc.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+
+  const setAssigneeMut = useMutation({
+    mutationFn: async (assigned_to: string | null) => {
+      if (!selectedId) throw new Error("no_conversation");
+      const { error } = await supabase.from("conversations").update({ assigned_to } as any).eq("id", selectedId);
+      if (error) throw error;
+      return assigned_to;
+    },
+    onMutate: async (assigned_to) => {
+      if (!selectedId) return;
+      patchConversationInCache(selectedId, { assigned_to } as any);
+    },
+    onError: () => {
+      qc.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+
+  const addTagMut = useMutation({
+    mutationFn: async (tag_id: string) => {
+      if (!selectedId) throw new Error("no_conversation");
+      const { error } = await supabase.from("conversation_tags").insert({ conversation_id: selectedId, tag_id } as any);
+      if (error) throw error;
+      return tag_id;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["conversation_tags", selectedId] });
+    },
+  });
+
+  const removeTagMut = useMutation({
+    mutationFn: async (tag_id: string) => {
+      if (!selectedId) throw new Error("no_conversation");
+      const { error } = await supabase
+        .from("conversation_tags")
+        .delete()
+        .eq("conversation_id", selectedId)
+        .eq("tag_id", tag_id);
+      if (error) throw error;
+      return tag_id;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["conversation_tags", selectedId] });
+    },
+  });
+
+  const aiAnalyzeMut = useMutation({
+    mutationFn: async () => {
+      if (!selectedId) throw new Error("no_conversation");
+      setAiLoading(true);
+      const res = await apiPost<{ ok: boolean; ai_meta?: any; error?: string }>("/v1/ai/analyze_conversation", { conversation_id: selectedId });
+      if (!res.ok) throw new Error(res.error || "ai_failed");
+      return res.ai_meta;
+    },
+    onSuccess: (ai_meta) => {
+      if (!selectedId) return;
+      patchConversationInCache(selectedId, { ai_meta } as any);
+    },
+    onSettled: () => setAiLoading(false),
+  });
+
+  // Mark as read
+  const markReadMut = useMutation({
+    mutationFn: async (convId: string) => {
+      // DB
+      await supabase.from("conversations").update({ unread_count: 0 }).eq("id", convId);
+      const contactId = selectedConversation?.contact_id;
+      if (contactId) {
+        // opcional: puede no existir la columna
+        await supabase
+          .from("contacts")
+          .update({ last_seen_by_agent_at: new Date().toISOString() } as any)
+          .eq("id", contactId);
+      }
+      // cache
+      qc.setQueryData(["conversations"], (old: any) => {
+        const arr = Array.isArray(old) ? [...old] : [];
+        const i = arr.findIndex((x: Conversation) => x.id === convId);
+        if (i >= 0) arr[i] = { ...arr[i], unread_count: 0 };
+        return arr;
+      });
+    },
+  });
+
+  React.useEffect(() => {
+    if (!selectedId) return;
+    if (!selectedConversation) return;
+    if ((selectedConversation.unread_count ?? 0) <= 0) return;
+    markReadMut.mutate(selectedId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  // Send message (optimistic)
+  const sendMut = useMutation({
+    mutationFn: async ({ conversationId, text, clientTempId }: { conversationId: string; text: string; clientTempId: string }) => {
+      const res = await apiPost<SendTextResponse>("/v1/messages/send_text", {
+        conversation_id: conversationId,
+        text,
+        client_temp_id: clientTempId,
+      });
+      if (!res.ok) throw new Error("send_failed");
+      return res;
+    },
+    onMutate: async (vars) => {
+      const nowIso = new Date().toISOString();
+      const optimistic: Message = {
+        id: vars.clientTempId,
+        conversation_id: vars.conversationId,
+        direction: "out",
+        type: "text",
+        text_body: vars.text,
+        status: "queued",
+        wa_message_id: null,
+        created_at: nowIso,
+      };
+
+      qc.setQueryData(["messages", vars.conversationId], (old: any) => {
+        const arr = Array.isArray(old) ? [...old] : [];
+        if (!arr.find((m: Message) => m.id === optimistic.id)) arr.push(optimistic);
+        return arr;
+      });
+
+      qc.setQueryData(["conversations"], (old: any) => {
+        const arr = Array.isArray(old) ? [...old] : [];
+        const i = arr.findIndex((c: Conversation) => c.id === vars.conversationId);
+        if (i >= 0) arr[i] = { ...arr[i], last_message_at: nowIso };
+        return arr;
+      });
+    },
+    onSuccess: (res, vars) => {
+      const realId = res.message_id || vars.clientTempId;
+      const createdAt = res.created_at || new Date().toISOString();
+      const nextStatus = (res.status as any) || "sent";
+
+      qc.setQueryData(["messages", vars.conversationId], (old: any) => {
+        const arr = Array.isArray(old) ? [...old] : [];
+        return arr.map((m: Message) => {
+          if (m.id !== vars.clientTempId) return m;
+          return {
+            ...m,
+            id: realId,
+            status: nextStatus,
+            wa_message_id: res.wa_message_id ?? m.wa_message_id,
+            created_at: createdAt,
+          };
+        });
+      });
+    },
+    onError: (_err, vars) => {
+      qc.setQueryData(["messages", vars.conversationId], (old: any) => {
+        const arr = Array.isArray(old) ? [...old] : [];
+        return arr.map((m: Message) => (m.id === vars.clientTempId ? { ...m, status: "failed" } : m));
+      });
+    },
+  });
+
+  const sendTemplateMut = useMutation({
+    mutationFn: async ({ templateName, language, bodyVars }: { templateName: string; language?: string; bodyVars?: string[] }) => {
+      if (!selectedId) return;
+      const res = await apiPost<any>("/v1/messages/send_template", {
+        conversation_id: selectedId,
+        template_name: templateName,
+        language: language || "es_AR",
+        body_vars: bodyVars || [],
+      });
+      if (!res.ok) throw new Error("template_send_failed");
+      return res;
+    },
+    onError: () => {},
+  });
+
+  const suggestReplyMut = useMutation({
+    mutationFn: async () => {
+      if (!selectedId) return;
+      const res = await apiPost<any>("/v1/ai/suggest_reply", { conversation_id: selectedId });
+      if (!res.ok) throw new Error("ai_suggest_failed");
+      return res;
+    },
+    onSuccess: (res) => {
+      if (res?.text) setComposer(String(res.text));
+    },
+  });
+
+  function sendCurrent() {
+    if (!selectedId) return;
+    const text = composer.trim();
+    if (!text) return;
+    setComposer("");
+    const temp = `tmp_${Date.now()}`;
+    sendMut.mutate({ conversationId: selectedId, text, clientTempId: temp });
+  }
+
+  function retryMessage(m: Message) {
+    if (!selectedId) return;
+    const text = (m.text_body || "").trim();
+    if (!text) return;
+    // Reusamos el mismo bubble: lo pasamos a queued y reenviamos
+    qc.setQueryData(["messages", selectedId], (old: any) => {
+      const arr = Array.isArray(old) ? [...old] : [];
+      return arr.map((x: Message) => (x.id === m.id ? { ...x, status: "queued" } : x));
+    });
+    const temp = `tmp_${Date.now()}`;
+    // creamos un nuevo bubble para no pisar el id real; el fallido queda como historial
+    sendMut.mutate({ conversationId: selectedId, text, clientTempId: temp });
+  }
+
+  function dueFromPreset(preset: "2d" | "7d" | "15d" | "tomorrow10"): string {
+    const now = new Date();
+    if (preset === "2d") now.setDate(now.getDate() + 2);
+    if (preset === "7d") now.setDate(now.getDate() + 7);
+    if (preset === "15d") now.setDate(now.getDate() + 15);
+    if (preset === "tomorrow10") {
+      now.setDate(now.getDate() + 1);
+      now.setHours(10, 0, 0, 0);
+    }
+    return now.toISOString();
+  }
+
+  // New chat
+  const contactsQ = useQuery({
+    queryKey: ["contacts_search", newChatQuery],
+    queryFn: () => searchContacts(newChatQuery),
+    enabled: newChatOpen,
+    staleTime: 4_000,
+  });
+
+  const startChatMut = useMutation({
+    mutationFn: async ({ contactId }: { contactId: string }) => {
+      const convId = await getOrCreateConversationForContact(contactId);
+      return convId;
+    },
+    onSuccess: async (convId) => {
+      setNewChatOpen(false);
+      setNewChatQuery("");
+      setNewChatName("");
+      setNewChatPhone("");
+      await qc.invalidateQueries({ queryKey: ["conversations"] });
+      setSp((prev) => {
+        prev.set("c", convId);
+        return prev;
+      });
+    },
+  });
+
+  const createAndStartChatMut = useMutation({
+    mutationFn: async () => {
+      const c = await getOrCreateContactByPhone(newChatPhone, newChatName);
+      const convId = await getOrCreateConversationForContact(c.id);
+      return convId;
+    },
+    onSuccess: async (convId) => {
+      setNewChatOpen(false);
+      setNewChatQuery("");
+      setNewChatName("");
+      setNewChatPhone("");
+      await qc.invalidateQueries({ queryKey: ["conversations"] });
+      setSp((prev) => {
+        prev.set("c", convId);
+        return prev;
+      });
+    },
+  });
+
+  // Notes + followups (kept simple, inside Details panel)
+  const addNoteMut = useMutation({
+    mutationFn: async () => {
+      if (!selectedId) return;
+      const body = noteBody.trim();
+      if (!body) throw new Error("Escribí una nota");
+      const { error } = await supabase.from("notes").insert({ conversation_id: selectedId, body });
+      if (error) throw error;
+    },
+    onSuccess: async () => {
+      setNoteBody("");
+      await qc.invalidateQueries({ queryKey: ["notes", selectedId] });
+    },
+  });
+
+  const addFollowupMut = useMutation({
+    mutationFn: async (dueIso: string) => {
+      if (!selectedId) return;
+      const { error } = await supabase.from("followups").insert({ conversation_id: selectedId, due_at: dueIso, reason: followupReason.trim() || null });
+      if (error) throw error;
+    },
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["followups", selectedId] });
+    },
+  });
+
+  const setFollowupStatusMut = useMutation({
+    mutationFn: async ({ id, status }: { id: string; status: "done" | "canceled" }) => {
+      const { error } = await supabase.from("followups").update({ status }).eq("id", id);
+      if (error) throw error;
+    },
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["followups", selectedId] });
+    },
+  });
+
+  // Realtime (append/patch, no full invalidate)
   React.useEffect(() => {
     const ch = supabase
-      .channel("rt:inbox")
+      .channel("wa-manager")
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "messages" },
-        (payload) => {
-          const m = (payload as any)?.new as Message | undefined;
-          if (!m?.conversation_id) return;
+        (payload: any) => {
+          const msg = payload.new as Message & { dealership_id?: string };
+          if (!msg?.conversation_id) return;
 
-          // 1) Mensajes: append si corresponde
-          qc.setQueryData(["messages", m.conversation_id], (old: any) => {
-            const arr: any[] = Array.isArray(old) ? [...old] : [];
-            if (arr.some((x) => x.id === m.id)) return arr;
-            arr.push(m);
-            arr.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+          // append to cache
+          qc.setQueryData(["messages", msg.conversation_id], (old: any) => {
+            const arr = Array.isArray(old) ? [...old] : [];
+            if (!arr.find((m: Message) => m.id === msg.id)) arr.push(msg as any);
             return arr;
           });
 
-          // 2) Conversaciones: actualizamos last_message_at y (si es inbound) unread_count
-          const nowIso = m.created_at ?? new Date().toISOString();
+          // patch conversation list
           qc.setQueryData(["conversations"], (old: any) => {
-            const list = Array.isArray(old) ? (old as Conversation[]) : [];
-            const current = list.find((c) => c.id === m.conversation_id);
-
-            const isOpen = conversationId === m.conversation_id;
-            const nextUnread = m.direction === "in" && !isOpen ? (current?.unread_count ?? 0) + 1 : current?.unread_count ?? 0;
-
-            return upsertConversationInList(list, {
-              id: m.conversation_id,
-              last_message_at: nowIso,
-              unread_count: nextUnread,
-            });
+            const arr = Array.isArray(old) ? [...old] : [];
+            const i = arr.findIndex((c: Conversation) => c.id === msg.conversation_id);
+            if (i >= 0) {
+              const current = arr[i] as Conversation;
+              const incUnread = msg.direction === "in" && msg.conversation_id !== selectedId;
+              arr[i] = {
+                ...current,
+                last_message_at: msg.created_at,
+                unread_count: incUnread ? (current.unread_count ?? 0) + 1 : current.unread_count,
+              };
+              // move to top
+              const [moved] = arr.splice(i, 1);
+              arr.unshift(moved);
+            }
+            return arr;
           });
 
-          // 3) Si el chat está abierto y entra un inbound, lo marcamos como leído (DB + cache)
-          if (conversationId && m.conversation_id === conversationId && m.direction === "in") {
-            supabase
-              .from("conversations")
-              .update({ unread_count: 0 })
-              .eq("id", conversationId)
-              .then(
-                () => {
-                  qc.setQueryData(["conversations"], (old: any) => upsertConversationInList(old, { id: conversationId, unread_count: 0 }));
-                },
-                () => {}
-              );
+          // if viewing the conversation, mark as read instantly
+          if (msg.direction === "in" && msg.conversation_id === selectedId) {
+            markReadMut.mutate(msg.conversation_id);
           }
         }
       )
       .on(
         "postgres_changes",
         { event: "UPDATE", schema: "public", table: "messages" },
-        (payload) => {
-          const m = (payload as any)?.new as Message | undefined;
-          if (!m?.conversation_id) return;
-          qc.setQueryData(["messages", m.conversation_id], (old: any) => {
-            const arr: any[] = Array.isArray(old) ? [...old] : [];
-            const idx = arr.findIndex((x) => x.id === m.id);
-            if (idx < 0) return arr;
-            arr[idx] = { ...arr[idx], ...m };
-            return arr;
+        (payload: any) => {
+          const msg = payload.new as Message;
+          if (!msg?.conversation_id) return;
+          qc.setQueryData(["messages", msg.conversation_id], (old: any) => {
+            const arr = Array.isArray(old) ? [...old] : [];
+            return arr.map((m: Message) => (m.id === msg.id ? { ...m, ...msg } : m));
           });
-        }
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "conversations" },
-        (payload) => {
-          const c = (payload as any)?.new as Partial<Conversation> | undefined;
-          if (!c?.id) return;
-          qc.setQueryData(["conversations"], (old: any) => upsertConversationInList(old, c as any));
         }
       )
       .subscribe();
@@ -370,835 +810,767 @@ export function InboxPage() {
     return () => {
       supabase.removeChannel(ch);
     };
-  }, [qc, conversationId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
 
-  // Mark as read + last_seen_by_agent_at al abrir
-  React.useEffect(() => {
-    if (!conversationId) return;
-
-    supabase
-      .from("conversations")
-      .update({ unread_count: 0 })
-      .eq("id", conversationId)
-      .then(
-        () => {
-          qc.setQueryData(["conversations"], (old: any) => upsertConversationInList(old, { id: conversationId, unread_count: 0 }));
-        },
-        () => {}
-      );
-
-    const contactId = activeConv?.contact_id;
-    if (contactId) {
-      supabase
-        .from("contacts")
-        .update({ last_seen_by_agent_at: new Date().toISOString() })
-        .eq("id", contactId)
-        .then(
-          () => {
-            // refresco leve del listado
-            qc.invalidateQueries({ queryKey: ["conversations"], exact: true });
-          },
-          () => {}
-        );
-    }
-  }, [conversationId, activeConv?.contact_id, qc]);
-
-  // Auto-scroll al final
-  const endRef = React.useRef<HTMLDivElement | null>(null);
-  React.useEffect(() => {
-    if (!conversationId) return;
-    requestAnimationFrame(() => endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }));
-  }, [conversationId, (msgsQ.data ?? []).length]);
-
-  // --- Mutations ---
-  const assignToMeM = useMutation({
-    mutationFn: async () => {
-      if (!user?.id || !conversationId) throw new Error("Missing");
-      const { error } = await supabase.from("conversations").update({ assigned_to: user.id }).eq("id", conversationId);
-      if (error) throw error;
-      return true;
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["conversations"], exact: true }),
-  });
-
-  const updateAssigneeM = useMutation({
-    mutationFn: async (assigned_to: string | null) => {
-      if (!conversationId) throw new Error("Missing");
-      const { error } = await supabase.from("conversations").update({ assigned_to }).eq("id", conversationId);
-      if (error) throw error;
-      return true;
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["conversations"], exact: true }),
-  });
-
-  const toggleTagM = useMutation({
-    mutationFn: async (tagId: string) => {
-      if (!conversationId) throw new Error("Missing");
-      const current = new Set(convTagsQ.data ?? []);
-      if (current.has(tagId)) {
-        const { error } = await supabase.from("conversation_tags").delete().eq("conversation_id", conversationId).eq("tag_id", tagId);
-        if (error) throw error;
-      } else {
-        const { error } = await supabase.from("conversation_tags").insert({ conversation_id: conversationId, tag_id: tagId });
-        if (error) throw error;
-      }
-      return true;
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["conversation_tags", conversationId], exact: true }),
-  });
-
-  const addFollowupM = useMutation({
-    mutationFn: async (payload: { due_at: string; reason?: string }) => {
-      if (!conversationId) throw new Error("Missing");
-      const { error } = await supabase
-        .from("followups")
-        .insert({ conversation_id: conversationId, due_at: payload.due_at, reason: payload.reason ?? null });
-      if (error) throw error;
-      return true;
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["followups", conversationId], exact: true });
-      qc.invalidateQueries({ queryKey: ["due_followups"], exact: true });
-    },
-  });
-
-  const updateFollowupStatusM = useMutation({
-    mutationFn: async (payload: { id: string; status: "done" | "canceled" | "pending" }) => {
-      const { error } = await supabase.from("followups").update({ status: payload.status }).eq("id", payload.id);
-      if (error) throw error;
-      return true;
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["followups", conversationId], exact: true });
-      qc.invalidateQueries({ queryKey: ["due_followups"], exact: true });
-    },
-  });
-
-  const addNoteM = useMutation({
-    mutationFn: async (body: string) => {
-      if (!conversationId) throw new Error("Missing");
-      const { error } = await supabase.from("notes").insert({ conversation_id: conversationId, body });
-      if (error) throw error;
-      return true;
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["notes", conversationId], exact: true }),
-  });
-
-  const sendTextM = useMutation({
-    mutationFn: async (vars: { text: string; client_id: string }) => {
-      if (!conversationId) throw new Error("No conversation");
-      return apiPost<SendTextResponse>("/v1/messages/send_text", { conversation_id: conversationId, text: vars.text });
-    },
-    onMutate: async (vars) => {
-      if (!conversationId) return;
-      const optimistic: Message & { __client_id?: string } = {
-        id: `tmp_${vars.client_id}`,
-        conversation_id: conversationId,
-        direction: "out",
-        type: "text",
-        text_body: vars.text,
-        status: "queued",
-        wa_message_id: null,
-        created_at: new Date().toISOString(),
-        __client_id: vars.client_id,
-      } as any;
-
-      qc.setQueryData(["messages", conversationId], (old: any) => {
-        const arr: any[] = Array.isArray(old) ? [...old] : [];
-        arr.push(optimistic);
-        arr.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-        return arr;
-      });
-
-      qc.setQueryData(["conversations"], (old: any) =>
-        upsertConversationInList(old, { id: conversationId, last_message_at: optimistic.created_at })
-      );
-
-      return { conversationId, optimisticId: optimistic.id };
-    },
-    onSuccess: (data, vars, ctx) => {
-      const convId = ctx?.conversationId;
-      if (!convId) return;
-
-      // Si el API devolvió message_id, reemplazamos el tmp. Si no, lo dejamos y el realtime lo corrige.
-      if (data?.message_id) {
-        qc.setQueryData(["messages", convId], (old: any) => {
-          const arr: any[] = Array.isArray(old) ? [...old] : [];
-          const tmpIdx = arr.findIndex((m) => m.id === ctx?.optimisticId);
-          const replacement: Message = {
-            id: data.message_id!,
-            conversation_id: convId,
-            direction: "out",
-            type: "text",
-            text_body: vars.text,
-            status: (data.status as any) || "sent",
-            wa_message_id: data.wa_message_id ?? null,
-            created_at: data.created_at || new Date().toISOString(),
-          };
-          if (tmpIdx >= 0) {
-            arr[tmpIdx] = { ...arr[tmpIdx], ...replacement };
-          } else if (!arr.some((m) => m.id === replacement.id)) {
-            arr.push(replacement);
-          }
-          arr.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-          return arr;
-        });
-      } else {
-        qc.setQueryData(["messages", convId], (old: any) => {
-          const arr: any[] = Array.isArray(old) ? [...old] : [];
-          const tmpIdx = arr.findIndex((m) => m.id === ctx?.optimisticId);
-          if (tmpIdx >= 0) arr[tmpIdx] = { ...arr[tmpIdx], status: "sent" };
-          return arr;
-        });
-      }
-    },
-    onError: (err, _vars, ctx) => {
-      const convId = ctx?.conversationId;
-      if (!convId) return;
-      qc.setQueryData(["messages", convId], (old: any) => {
-        const arr: any[] = Array.isArray(old) ? [...old] : [];
-        const idx = arr.findIndex((m) => m.id === ctx?.optimisticId);
-        if (idx >= 0) arr[idx] = { ...arr[idx], status: "failed", __error: friendlyError(err) };
-        return arr;
-      });
-    },
-  });
-
-  // --- Filters ---
-  const filteredConversations = React.useMemo(() => {
-    const all = convQ.data ?? [];
-    const q = search.trim().toLowerCase();
-
-    return all.filter((c) => {
-      if (filter === "mine" && user?.id && c.assigned_to !== user.id) return false;
-      if (filter === "unassigned" && c.assigned_to != null) return false;
-      if (filter === "unread" && !(c.unread_count > 0)) return false;
-
-      if (!q) return true;
-      const name = (c.contact?.name ?? "").toLowerCase();
-      const phone = (c.contact?.phone_e164 ?? "").toLowerCase();
-      return name.includes(q) || phone.includes(q);
-    });
-  }, [convQ.data, filter, search, user?.id]);
-
-  // --- Chat composer ---
-  const [draft, setDraft] = React.useState("");
-  const [noteDraft, setNoteDraft] = React.useState("");
-  const composerRef = React.useRef<HTMLTextAreaElement | null>(null);
-
-  const suggestReplyM = useMutation({
-    mutationFn: async () => {
-      if (!conversationId) throw new Error("No conversation");
-      return apiPost<{ ok: boolean; text?: string }>("/v1/ai/suggest_reply", { conversation_id: conversationId });
-    },
-    onSuccess: (d) => {
-      if (d?.text) {
-        setDraft(d.text);
-        // scroll will happen on send; no need here
-      }
-      setAiOpen(false);
-    },
-  });
-
-  function openConversation(id: string) {
-    setSp({ c: id });
-  }
-
-  function retryMessage(msg: any) {
-    if (!msg?.text_body) return;
-    const client_id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    sendTextM.mutate({ text: String(msg.text_body), client_id });
-  }
-
-  const headerName = activeConv ? activeConv.contact?.name || activeConv.contact?.phone_e164 || "Sin nombre" : "Seleccioná una conversación";
-  const headerPhone = activeConv ? activeConv.contact?.phone_e164 : "";
-
-  const DetailsInner = (
-    !conversationId ? (
-      <div className="text-sm text-slate-500 dark:text-slate-400">Detalles</div>
-    ) : (
-      <>
-        <div className="flex flex-col gap-2">
-          <SectionTitle icon={<UserPlus size={14} />} title="Asignación" />
-          <select
-            className="w-full rounded-xl border border-[var(--app-border)] bg-transparent px-3 py-2 text-sm"
-            value={activeConv?.assigned_to ?? ""}
-            onChange={(e) => updateAssigneeM.mutate(e.target.value ? e.target.value : null)}
-          >
-            <option value="">Sin asignar</option>
-            {(profilesQ.data ?? []).map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.full_name || p.id.slice(0, 8)} ({p.role})
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="flex flex-col gap-2">
-          <SectionTitle icon={<TagIcon size={14} />} title="Etiquetas" />
-          <div className="flex flex-wrap gap-2">
-            {(tagsQ.data ?? []).map((t) => {
-              const on = (convTagsQ.data ?? []).includes(t.id);
-              return (
-                <button
-                  key={t.id}
-                  className={`rounded-full border border-[var(--app-border)] px-3 py-1 text-xs transition ${
-                    on
-                      ? "bg-slate-900 text-white dark:bg-slate-200 dark:text-slate-900"
-                      : "bg-[var(--app-card)] hover:bg-black/5 dark:hover:bg-white/10"
-                  }`}
-                  onClick={() => toggleTagM.mutate(t.id)}
-                  type="button"
-                >
-                  {t.name}
-                </button>
-              );
-            })}
-            {(tagsQ.data ?? []).length === 0 ? (
-              <span className="text-xs text-slate-500 dark:text-slate-400">Creá tags en Settings</span>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-2">
-          <SectionTitle icon={<Bell size={14} />} title="Recordatorios" />
-          <FollowupComposer onAdd={(due_at, reason) => addFollowupM.mutate({ due_at, reason })} />
-
-          <div className="flex flex-col gap-2">
-            {(followupsQ.data ?? []).map((f) => {
-              const overdue = f.status === "pending" && new Date(f.due_at).getTime() <= Date.now();
-              return (
-                <div
-                  key={f.id}
-                  className={`rounded-2xl border border-[var(--app-border)] p-3 ${
-                    overdue ? "border-amber-300 bg-amber-50 dark:bg-amber-950/20" : "bg-transparent"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="text-sm font-medium">{new Date(f.due_at).toLocaleString()}</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-300 mt-1">{f.reason || "(sin motivo)"}</div>
-                      <div className="text-xs mt-2">
-                        Estado: <span className="font-medium">{f.status}</span>
-                        {overdue ? <span className="ml-2 font-semibold text-amber-700 dark:text-amber-300">VENCIDO</span> : null}
-                      </div>
-                    </div>
-                    <div className="flex flex-col gap-2">
-                      {f.status === "pending" ? (
-                        <>
-                          <button
-                            className="rounded-xl border border-[var(--app-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/10"
-                            type="button"
-                            onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "done" })}
-                          >
-                            Hecho
-                          </button>
-                          <button
-                            className="rounded-xl border border-[var(--app-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/10"
-                            type="button"
-                            onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "canceled" })}
-                          >
-                            Cancelar
-                          </button>
-                        </>
-                      ) : (
-                        <button
-                          className="rounded-xl border border-[var(--app-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/10"
-                          type="button"
-                          onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "pending" })}
-                        >
-                          Reabrir
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-            {(followupsQ.data ?? []).length === 0 ? (
-              <span className="text-xs text-slate-500 dark:text-slate-400">No hay recordatorios</span>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-2">
-          <SectionTitle icon={<StickyNote size={14} />} title="Notas internas" />
-          <div className="rounded-2xl border border-[var(--app-border)] p-3">
-            <textarea
-              className="w-full min-h-[70px] rounded-xl border border-[var(--app-border)] bg-transparent px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-900/20 dark:focus:ring-slate-200/20"
-              placeholder="Ej: Le interesa Vento/Corolla, presupuesto 12M, quiere permuta…"
-              value={noteDraft}
-              onChange={(e) => setNoteDraft(e.target.value)}
-            />
-            <button
-              className="mt-2 rounded-xl bg-slate-900 text-white dark:bg-slate-200 dark:text-slate-900 px-3 py-2 text-sm hover:opacity-95 disabled:opacity-50"
-              disabled={!noteDraft.trim() || addNoteM.isPending}
-              type="button"
-              onClick={() => {
-                const body = noteDraft.trim();
-                if (!body) return;
-                setNoteDraft("");
-                addNoteM.mutate(body);
-              }}
-            >
-              Guardar nota
-            </button>
-          </div>
-
-          <div className="flex flex-col gap-2">
-            {(notesQ.data ?? []).map((n) => (
-              <div key={n.id} className="rounded-2xl border border-[var(--app-border)] p-3">
-                <div className="text-xs text-slate-500 dark:text-slate-400">{new Date(n.created_at).toLocaleString()}</div>
-                <div className="mt-1 text-sm whitespace-pre-wrap break-words">{n.body}</div>
-              </div>
-            ))}
-            {(notesQ.data ?? []).length === 0 ? (
-              <span className="text-xs text-slate-500 dark:text-slate-400">No hay notas</span>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="rounded-2xl border border-[var(--app-border)] p-3 text-xs text-slate-600 dark:text-slate-300">
-          <div className="font-semibold text-slate-800 dark:text-slate-100">Checklist anti-perdida de leads</div>
-          <div className="mt-1">
-            • Asignate el lead apenas entra • Programá seguimiento (+2 / +7 / +15 días) • Dejá nota de intención y presupuesto.
-          </div>
-        </div>
-      </>
-    )
-  );
+  // Layout helpers
+  const showChatOnlyOnMobile = isMobile && selectedId;
 
   return (
-    <div className="h-full w-full flex flex-col md:flex-row bg-[var(--app-bg)]">
-      {/* Left: Inbox */}
+    <div className="h-full w-full flex bg-[var(--wa-bg)]">
+      {/* LEFT: conversation list */}
       <div
-        className={`w-full md:w-[360px] border-r border-[var(--app-border)] bg-[var(--app-card)] flex flex-col min-w-0 ${
-          isSmall && conversationId ? "hidden" : "flex"
-        }`}
+        className={cx(
+          "h-full border-r border-[var(--wa-border)] bg-[var(--wa-panel)] flex flex-col",
+          showChatOnlyOnMobile ? "hidden" : "w-full md:w-[380px]"
+        )}
       >
-        <div className="p-4 border-b border-[var(--app-border)]">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-sm font-semibold">Inbox</div>
-              <div className="text-xs text-slate-500">Respuestas rápidas, sin perder leads</div>
-            </div>
-            <div className="text-xs text-slate-500 flex items-center gap-2">
-              <Filter size={14} />
-              <span>{filteredConversations.length}</span>
-            </div>
+        <div className="px-3 py-3 bg-[var(--wa-header)] border-b border-[var(--wa-border)]">
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-semibold">Chats</div>
+            <button
+              type="button"
+              className="h-10 w-10 rounded-xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center"
+              onClick={() => setNewChatOpen(true)}
+              aria-label="Nuevo chat"
+              title="Nuevo chat"
+            >
+              <MessageSquarePlus size={20} />
+            </button>
           </div>
-
-          <div className="mt-3 flex items-center gap-2 rounded-2xl border border-[var(--app-border)] px-3 py-2">
-            <Search size={16} className="text-slate-500" />
+          <div className="mt-2 flex items-center gap-2">
+            <div className="h-10 w-10 rounded-xl bg-black/5 dark:bg-white/10 inline-flex items-center justify-center">
+              <Search size={18} />
+            </div>
             <input
-              className="w-full text-sm outline-none bg-transparent"
-              placeholder="Buscar por nombre o teléfono"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              className="flex-1 bg-transparent outline-none text-sm"
+              placeholder="Buscar nombre o teléfono"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
             />
-            {search ? (
-              <button className="text-slate-500 hover:text-slate-800" onClick={() => setSearch("")}
+          </div>
+
+          <div className="mt-3 flex items-center gap-2 overflow-x-auto">
+            {([
+              ["all", "Todos"],
+              ["mine", "Asignadas"],
+              ["unassigned", "Sin asignar"],
+              ["unread", "No leídas"],
+            ] as Array<[InboxFilter, string]>).map(([k, label]) => (
+              <button
+                key={k}
                 type="button"
+                onClick={() => setFilter(k)}
+                className={cx(
+                  "whitespace-nowrap rounded-full px-3 py-1 text-xs border",
+                  filter === k
+                    ? "bg-[var(--wa-accent)] text-white border-[var(--wa-accent)]"
+                    : "bg-transparent border-[var(--wa-border)] text-[var(--wa-text)]/90 hover:bg-black/5 dark:hover:bg-white/5"
+                )}
               >
-                <X size={16} />
+                {label}
               </button>
-            ) : null}
+            ))}
           </div>
-
-          <div className="mt-3 flex flex-wrap gap-2">
-            <Pill active={filter === "all"} onClick={() => setFilter("all")}>Todos</Pill>
-            <Pill active={filter === "mine"} onClick={() => setFilter("mine")}>Asignadas a mí</Pill>
-            <Pill active={filter === "unassigned"} onClick={() => setFilter("unassigned")}>Sin asignar</Pill>
-            <Pill active={filter === "unread"} onClick={() => setFilter("unread")}>No leídas</Pill>
-          </div>
-        </div>
-
-        {/* Reminders / Follow-ups vencidos */}
-        <div className="border-b border-[var(--app-border)] bg-[var(--app-card)] p-3">
-          <SectionTitle
-            icon={<Clock size={14} />}
-            title="Recordatorios vencidos"
-            right={
-              <span className="text-xs text-slate-500">{(dueFupsQ.data ?? []).length}</span>
-            }
-          />
-          {dueFupsQ.isLoading ? (
-            <div className="mt-2 text-xs text-slate-500">Cargando...</div>
-          ) : (dueFupsQ.data ?? []).length === 0 ? (
-            <div className="mt-2 text-xs text-slate-500">Nada vencido. Bien.</div>
-          ) : (
-            <div className="mt-2 flex flex-col gap-2 max-h-[140px] overflow-auto pr-1">
-              {(dueFupsQ.data ?? []).map((f) => (
-                <button
-                  key={f.id}
-                  type="button"
-                  className="text-left rounded-2xl border px-3 py-2 hover:bg-slate-50"
-                  onClick={() => openConversation(f.conversation_id)}
-                >
-                  <div className="text-xs font-semibold truncate">{f.reason || "Seguimiento"}</div>
-                  <div className="text-[11px] text-slate-500 mt-0.5">Venció {formatDistanceToNowStrict(new Date(f.due_at), { addSuffix: true })}</div>
-                </button>
-              ))}
-            </div>
-          )}
         </div>
 
         <div className="flex-1 overflow-auto">
-          {convQ.isLoading ? (
-            <div className="p-4 text-sm text-slate-500">Cargando...</div>
-          ) : convQ.error ? (
-            <div className="p-4 text-sm text-red-700">Error: {friendlyError(convQ.error)}</div>
-          ) : (
-            <div className="p-2 flex flex-col gap-1">
-              {filteredConversations.map((c) => {
-                const active = c.id === conversationId;
-                const name = c.contact?.name || c.contact?.phone_e164 || "Sin nombre";
-                const phone = c.contact?.phone_e164 || "";
-                const when = c.last_message_at
-                  ? formatDistanceToNowStrict(new Date(c.last_message_at), { addSuffix: true })
-                  : "—";
+          {conversationsQ.isLoading ? (
+            <div className="p-4 text-sm text-[var(--wa-subtext)]">Cargando…</div>
+          ) : null}
 
-                return (
-                  <button
-                    key={c.id}
-                    className={`text-left rounded-2xl border px-3 py-2 hover:bg-slate-50 transition ${
-                      active ? "bg-slate-900 text-white border-slate-900 hover:bg-slate-900" : "bg-white"
-                    }`}
-                    onClick={() => openConversation(c.id)}
-                    type="button"
-                  >
+          {visibleConversations.map((c) => {
+            const active = c.id === selectedId;
+            const name = c.contact?.name || "Sin nombre";
+            const phone = c.contact?.phone_e164 || "";
+            return (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => {
+                  setSp((prev) => {
+                    prev.set("c", c.id);
+                    return prev;
+                  });
+                }}
+                className={cx(
+                  "w-full text-left px-3 py-3 border-b border-[var(--wa-border)] hover:bg-black/5 dark:hover:bg-white/5",
+                  active && "bg-black/5 dark:bg-white/5"
+                )}
+              >
+                <div className="flex items-center gap-3">
+                  <div className="h-11 w-11 rounded-full bg-black/5 dark:bg-white/10 inline-flex items-center justify-center shrink-0">
+                    <User size={18} />
+                  </div>
+                  <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="font-medium text-sm truncate">{name}</div>
-                        <div className={`text-xs truncate ${active ? "text-white/70" : "text-slate-500"}`}>{phone}</div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {c.unread_count > 0 ? (
-                          <span className={`text-xs rounded-full px-2 py-0.5 ${active ? "bg-white/20" : "bg-slate-900 text-white"}`}>
-                            {c.unread_count}
-                          </span>
-                        ) : null}
-                      </div>
+                      <div className="font-medium truncate">{name}</div>
+                      {(c.unread_count ?? 0) > 0 ? (
+                        <div className="h-5 min-w-[20px] px-2 rounded-full bg-[var(--wa-accent)] text-white text-xs inline-flex items-center justify-center">
+                          {c.unread_count}
+                        </div>
+                      ) : null}
                     </div>
-                    <div className={`text-xs mt-1 flex items-center justify-between ${active ? "text-white/70" : "text-slate-500"}`}>
-                      <span className="truncate">{when}</span>
-                      <span className="ml-2">{c.assigned_to ? "Asignado" : "Sin asignar"}</span>
+                    <div className="text-xs text-[var(--wa-subtext)] truncate">{phone}</div>
+                    <div className="mt-1 flex items-center gap-2">
+                      <span className={cx("inline-flex items-center rounded-full px-2 py-0.5 text-[11px]", stageBadgeClass((c as any).lead_stage))}>
+                        {STAGE_LABEL[(c as any).lead_stage || "new"] || "Nuevo"}
+                      </span>
+                      {(c as any).lead_source ? (
+                        <span className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] bg-black/5 dark:bg-white/10 text-[var(--wa-text)]/80">
+                          {SOURCE_LABEL[String((c as any).lead_source)] || String((c as any).lead_source)}
+                        </span>
+                      ) : null}
                     </div>
-                  </button>
-                );
-              })}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
 
-              {filteredConversations.length === 0 ? (
-                <div className="p-4 text-sm text-slate-500">No hay conversaciones con ese filtro.</div>
-              ) : null}
-            </div>
-          )}
+          {!conversationsQ.isLoading && visibleConversations.length === 0 ? (
+            <div className="p-4 text-sm text-[var(--wa-subtext)]">No hay conversaciones para mostrar.</div>
+          ) : null}
         </div>
       </div>
 
-      {/* Middle: Chat */}
-      <div className={`flex-1 min-w-0 flex flex-col ${isSmall && !conversationId ? "hidden" : "flex"}`}>
-        <div className="h-14 border-b border-[var(--app-border)] bg-[var(--app-card)] px-2 md:px-4 flex items-center justify-between gap-2">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 min-w-0">
-              {isSmall ? (
-                <button
-                  type="button"
-                  className="h-10 w-10 rounded-xl hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center"
-                  onClick={() => setSp((p) => {
-                    p.delete("c");
-                    return p;
-                  })}
-                  aria-label="Volver"
-                >
-                  <ChevronLeft size={20} />
-                </button>
-              ) : null}
-
-              <div className="min-w-0">
-                <div className="text-sm font-semibold truncate">{headerName}</div>
-                <div className="text-xs text-slate-500 dark:text-slate-400 truncate">{headerPhone}</div>
-              </div>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            {conversationId ? (
-              <>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAiOpen(true);
-                    suggestReplyM.mutate();
-                  }}
-                  className="rounded-xl border border-[var(--app-border)] px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center gap-2"
-                >
-                  {suggestReplyM.isPending ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-                  IA
-                </button>
-                <a
-                  href={headerPhone ? `tel:${headerPhone.replace(/\s/g, "")}` : "#"}
-                  className={`rounded-xl border border-[var(--app-border)] px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center gap-2 ${
-                    headerPhone ? "" : "pointer-events-none opacity-50"
-                  }`}
-                >
-                  <Phone size={16} />
-                  Llamar
-                </a>
-                <button
-                  onClick={() => assignToMeM.mutate()}
-                  className="rounded-xl border border-[var(--app-border)] px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center gap-2"
-                  type="button"
-                >
-                  <UserPlus size={16} />
-                  Asignarme
-                </button>
-                {isNarrow ? (
-                  <button
-                    type="button"
-                    onClick={() => setDetailsOpen(true)}
-                    className="h-10 w-10 rounded-xl border hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center"
-                    aria-label="Detalles"
-                  >
-                    <MoreVertical size={18} />
-                  </button>
-                ) : null}
-              </>
+      {/* RIGHT: chat */}
+      <div className={cx("flex-1 min-w-0 h-full flex flex-col", !selectedId && "bg-[var(--wa-chat-bg)]")}> 
+        {/* Header */}
+        <div className="h-14 shrink-0 bg-[var(--wa-header)] border-b border-[var(--wa-border)] flex items-center justify-between px-3">
+          <div className="flex items-center gap-2 min-w-0">
+            {isMobile && selectedId ? (
+              <button
+                type="button"
+                className="h-10 w-10 rounded-xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center"
+                onClick={() => {
+                  setSp((prev) => {
+                    prev.delete("c");
+                    return prev;
+                  });
+                }}
+                aria-label="Volver"
+              >
+                <ChevronLeft size={20} />
+              </button>
             ) : null}
+
+            {selectedConversation ? (
+              <>
+                <div className="h-10 w-10 rounded-full bg-black/5 dark:bg-white/10 inline-flex items-center justify-center shrink-0">
+                  <User size={18} />
+                </div>
+                <div className="min-w-0">
+                  <div className="font-medium truncate">{selectedConversation.contact?.name || "Sin nombre"}</div>
+                  <div className="text-xs text-[var(--wa-subtext)] truncate inline-flex items-center gap-1">
+                    <Phone size={13} /> {selectedConversation.contact?.phone_e164}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="text-sm text-[var(--wa-subtext)]">Seleccioná un chat</div>
+            )}
           </div>
+
+          {selectedId ? (
+            <button
+              type="button"
+              className="h-10 w-10 rounded-xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center"
+              onClick={() => setDetailsOpen((v) => !v)}
+              aria-label="Detalles"
+              title="Detalles"
+            >
+              <Info size={20} />
+            </button>
+          ) : null}
         </div>
 
-        <div className="flex-1 overflow-auto p-4">
-          {!conversationId ? (
-            <div className="h-full grid place-items-center text-sm text-slate-500">Elegí un chat a la izquierda.</div>
-          ) : msgsQ.isLoading ? (
-            <div className="text-sm text-slate-500">Cargando mensajes...</div>
-          ) : msgsQ.error ? (
-            <div className="text-sm text-red-700">Error: {friendlyError(msgsQ.error)}</div>
-          ) : (
-            <div className="flex flex-col gap-2">
-              {(msgsQ.data ?? []).map((m: any) => {
-                const mine = m.direction === "out";
-                const isFailed = m.status === "failed";
-                const isQueued = m.status === "queued";
-                const ts = new Date(m.created_at).toLocaleString();
-                return (
-                  <div key={m.id} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
-                    <div className={`max-w-[78%] rounded-2xl px-3 py-2 text-sm border ${mine ? "bg-slate-900 text-white border-slate-900" : "bg-white"}`}>
-                      <div className="whitespace-pre-wrap break-words">{m.text_body || "(sin texto)"}</div>
-                      <div className={`mt-1 flex items-center justify-between gap-3 text-[11px] ${mine ? "text-white/70" : "text-slate-500"}`}>
-                        <span className="truncate">{ts}</span>
-                        {mine ? (
-                          <span className="inline-flex items-center gap-1">
-                            {isQueued ? <span>Enviando…</span> : null}
-                            {isFailed ? <span>No enviado</span> : null}
-                            {!isQueued && !isFailed ? <StatusIcon status={m.status} /> : null}
-                          </span>
-                        ) : (
-                          <span>{m.status}</span>
-                        )}
+        {/* Body */}
+        {selectedId ? (
+          <div className="flex-1 min-h-0 flex">
+            <div className="flex-1 min-w-0 flex flex-col bg-[var(--wa-chat-bg)]">
+              <div className="flex-1 overflow-auto p-3 md:p-4">
+                {(messagesQ.data ?? []).map((m) => {
+                  const isOut = m.direction === "out";
+                  const bubbleClass = isOut ? "bg-[var(--wa-bubble-out)] text-[var(--wa-bubble-out-text)]" : "bg-[var(--wa-bubble-in)] text-[var(--wa-bubble-in-text)]";
+                  return (
+                    <div key={m.id} className={cx("mb-2 flex", isOut ? "justify-end" : "justify-start")}>
+                      <div className={cx("max-w-[82%] rounded-2xl px-3 py-2 shadow-sm", bubbleClass)}>
+                        <div className="text-sm whitespace-pre-wrap break-words">{m.text_body}</div>
+                        <div className="mt-1 flex items-center justify-end gap-1 text-[11px] text-[var(--wa-subtext)]">
+                          {m.status === "queued" ? <span>Enviando…</span> : null}
+                          {m.status === "failed" ? (
+                            <button
+                              type="button"
+                              className="text-red-600 hover:underline"
+                              onClick={() => retryMessage(m)}
+                            >
+                              Reintentar
+                            </button>
+                          ) : null}
+                          <StatusTicks status={m.status} />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {messagesQ.isLoading ? <div className="text-sm text-[var(--wa-subtext)]">Cargando mensajes…</div> : null}
+              </div>
+
+              {/* Composer */}
+              <div className="shrink-0 border-t border-[var(--wa-border)] bg-[var(--wa-header)] p-2">
+                <div className="flex items-end gap-2">
+                  <div className="flex items-center gap-1 pb-1">
+                    <button
+                      type="button"
+                      className="h-11 w-11 rounded-2xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center"
+                      onClick={() => setQrPickerOpen(true)}
+                      aria-label="Respuestas rápidas"
+                      title="Respuestas rápidas"
+                    >
+                      <Bookmark size={18} />
+                    </button>
+                    <button
+                      type="button"
+                      className="h-11 w-11 rounded-2xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center"
+                      onClick={() => setTplPickerOpen(true)}
+                      aria-label="Plantillas"
+                      title="Plantillas"
+                    >
+                      <FileText size={18} />
+                    </button>
+                    <button
+                      type="button"
+                      className="h-11 w-11 rounded-2xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center disabled:opacity-60"
+                      onClick={() => suggestReplyMut.mutate()}
+                      disabled={!selectedId || suggestReplyMut.isPending}
+                      aria-label="Sugerir respuesta con IA"
+                      title="Sugerir respuesta con IA"
+                    >
+                      {suggestReplyMut.isPending ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />}
+                    </button>
+                  </div>
+                  <textarea
+                    className="flex-1 resize-none rounded-2xl border border-[var(--wa-border)] bg-[var(--wa-panel)] px-3 py-2 text-sm outline-none min-h-[42px] max-h-32"
+                    placeholder="Escribí un mensaje"
+                    value={composer}
+                    onChange={(e) => setComposer(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        sendCurrent();
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={sendCurrent}
+                    className="h-11 w-11 rounded-2xl bg-[var(--wa-accent)] text-white inline-flex items-center justify-center hover:opacity-95 disabled:opacity-60"
+                    disabled={!composer.trim() || sendMut.isPending}
+                    aria-label="Enviar"
+                    title="Enviar"
+                  >
+                    {sendMut.isPending ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+                  </button>
+                </div>
+                {sendMut.isError ? (
+                  <div className="mt-2 text-sm text-red-600">{friendlyError(sendMut.error)}</div>
+                ) : null}
+              </div>
+            </div>
+
+            {/* Details panel */}
+            {detailsOpen ? (
+              <div className="hidden lg:flex w-[360px] border-l border-[var(--wa-border)] bg-[var(--wa-panel)] flex-col">
+                <div className="px-3 py-3 bg-[var(--wa-header)] border-b border-[var(--wa-border)] flex items-center justify-between">
+                  <div className="font-semibold text-sm">Detalles</div>
+                  <button
+                    type="button"
+                    className="h-9 w-9 rounded-xl hover:bg-black/5 dark:hover:bg-white/5 inline-flex items-center justify-center"
+                    onClick={() => setDetailsOpen(false)}
+                    aria-label="Cerrar"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
+                <div className="p-3 flex flex-col gap-4 overflow-auto">
+                  {/* Lead / Pipeline */}
+                  <div className="rounded-2xl border border-[var(--wa-border)] overflow-hidden">
+                    <div className="px-3 py-2 bg-[var(--wa-header)] text-sm font-semibold">Lead</div>
+                    <div className="p-3 space-y-3">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Pipeline</div>
+                          <select
+                            className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                            value={(selectedConversation as any)?.lead_stage || "new"}
+                            onChange={(e) => setStageMut.mutate(e.target.value as any)}
+                          >
+                            {Object.keys(STAGE_LABEL).map((k) => (
+                              <option key={k} value={k}>
+                                {STAGE_LABEL[k]}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Fuente</div>
+                          <select
+                            className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                            value={(selectedConversation as any)?.lead_source || ""}
+                            onChange={(e) => setSourceMut.mutate((e.target.value || null) as any)}
+                          >
+                            <option value="">—</option>
+                            {Object.keys(SOURCE_LABEL).map((k) => (
+                              <option key={k} value={k}>
+                                {SOURCE_LABEL[k]}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
                       </div>
 
-                      {mine && isFailed ? (
-                        <div className="mt-2 flex items-center justify-between gap-2">
-                          <div className="text-[11px] text-white/80 truncate">{m.__error || "Falló el envío"}</div>
+                      <div>
+                        <div className="text-xs text-[var(--wa-subtext)] mb-1">Asignado a</div>
+                        <div className="flex items-center gap-2">
+                          <select
+                            className="flex-1 rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                            value={(selectedConversation?.assigned_to || "") as any}
+                            onChange={(e) => setAssigneeMut.mutate(e.target.value || null)}
+                          >
+                            <option value="">Sin asignar</option>
+                            {(profilesQ.data ?? []).map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.full_name || p.id.slice(0, 8)}
+                              </option>
+                            ))}
+                          </select>
+                          {!selectedConversation?.assigned_to && me?.id ? (
+                            <button
+                              type="button"
+                              className="rounded-xl bg-[var(--wa-accent)] text-white px-3 py-2 text-sm font-semibold hover:opacity-95"
+                              onClick={() => setAssigneeMut.mutate(String(me.id))}
+                            >
+                              Asignarme
+                            </button>
+                          ) : null}
+                        </div>
+                        <div className="mt-1 text-[11px] text-[var(--wa-subtext)]">
+                          Tip: los chats nuevos se auto-asignan de forma automática (por teléfono) cuando entran.
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-xs text-[var(--wa-subtext)] mb-1">Tags</div>
+                        <div className="flex flex-wrap gap-2">
+                          {(convTagsQ.data ?? []).map((ct) => (
+                            <button
+                              key={ct.tag_id}
+                              type="button"
+                              className="inline-flex items-center gap-1 rounded-full bg-black/5 dark:bg-white/10 px-3 py-1 text-xs"
+                              onClick={() => removeTagMut.mutate(ct.tag_id)}
+                              title="Quitar"
+                            >
+                              <span>{ct.tag?.name || "Tag"}</span>
+                              <X size={14} />
+                            </button>
+                          ))}
+                          {((convTagsQ.data ?? []).length === 0) ? (
+                            <div className="text-sm text-[var(--wa-subtext)]">Sin tags.</div>
+                          ) : null}
+                        </div>
+                        <div className="mt-2">
+                          <select
+                            className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                            value=""
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              if (!v) return;
+                              const already = (convTagsQ.data ?? []).some((x) => x.tag_id === v);
+                              if (!already) addTagMut.mutate(v);
+                            }}
+                          >
+                            <option value="">Agregar tag…</option>
+                            {(tagsQ.data ?? []).filter((t) => !(convTagsQ.data ?? []).some((x) => x.tag_id === t.id)).map((t) => (
+                              <option key={t.id} value={t.id}>
+                                {t.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* AI */}
+                  <div className="rounded-2xl border border-[var(--wa-border)] overflow-hidden">
+                    <div className="px-3 py-2 bg-[var(--wa-header)] text-sm font-semibold flex items-center justify-between">
+                      <span>IA</span>
+                      <button
+                        type="button"
+                        className="rounded-xl bg-[var(--wa-accent)] text-white px-3 py-1.5 text-xs font-semibold hover:opacity-95 disabled:opacity-60"
+                        onClick={() => aiAnalyzeMut.mutate()}
+                        disabled={aiLoading || aiAnalyzeMut.isPending}
+                      >
+                        {aiLoading ? "Analizando…" : "Analizar"}
+                      </button>
+                    </div>
+                    <div className="p-3 space-y-3">
+                      {selectedConversation?.ai_meta?.summary ? (
+                        <div>
+                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Resumen</div>
+                          <div className="text-sm whitespace-pre-wrap">{String(selectedConversation.ai_meta.summary)}</div>
+                        </div>
+                      ) : (
+                        <div className="text-sm text-[var(--wa-subtext)]">Pedile a la IA un resumen, intención, objeciones y próximos pasos.</div>
+                      )}
+
+                      {selectedConversation?.ai_meta?.intent ? (
+                        <div>
+                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Intención</div>
+                          <div className="text-sm">{String(selectedConversation.ai_meta.intent)}</div>
+                        </div>
+                      ) : null}
+
+                      {(selectedConversation?.ai_meta?.objections || []).length ? (
+                        <div>
+                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Objeciones</div>
+                          <div className="flex flex-wrap gap-2">
+                            {(selectedConversation.ai_meta.objections as any[]).slice(0, 6).map((o, i) => (
+                              <span key={i} className="inline-flex items-center rounded-full bg-black/5 dark:bg-white/10 px-3 py-1 text-xs">
+                                {String(o)}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {(selectedConversation?.ai_meta?.next_steps || []).length ? (
+                        <div>
+                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Próximos pasos</div>
+                          <ul className="list-disc pl-5 text-sm space-y-1">
+                            {(selectedConversation.ai_meta.next_steps as any[]).slice(0, 6).map((s, i) => (
+                              <li key={i}>{String(s)}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+
+                      {selectedConversation?.ai_meta?.recommended_stage ? (
+                        <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--wa-border)] px-3 py-2">
+                          <div className="text-sm">
+                            Recomendado: <span className="font-semibold">{STAGE_LABEL[String(selectedConversation.ai_meta.recommended_stage)] || String(selectedConversation.ai_meta.recommended_stage)}</span>
+                          </div>
                           <button
                             type="button"
-                            onClick={() => retryMessage(m)}
-                            className="rounded-full bg-white/10 px-3 py-1 text-[11px] hover:bg-white/15"
+                            className="rounded-xl bg-[var(--wa-accent)] text-white px-3 py-1.5 text-xs font-semibold hover:opacity-95"
+                            onClick={() => setStageMut.mutate(String(selectedConversation.ai_meta.recommended_stage) as any)}
                           >
-                            Reintentar
+                            Aplicar
                           </button>
                         </div>
                       ) : null}
                     </div>
                   </div>
-                );
-              })}
-              <div ref={endRef} />
-            </div>
-          )}
-        </div>
 
-        <div className="border-t border-[var(--app-border)] bg-[var(--app-card)] p-3">
-          <form
-            className="flex items-end gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!conversationId) return;
-              const text = draft.trim();
-              if (!text) return;
-              const client_id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-              setDraft("");
-              sendTextM.mutate({ text, client_id });
-            }}
-          >
-            <div className="relative">
-              <button
-                type="button"
-                disabled={!conversationId}
-                onClick={() => setQrOpen((v) => !v)}
-                className="h-[44px] w-[44px] rounded-2xl border border-[var(--app-border)] hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center disabled:opacity-50"
-                aria-label="Respuestas rápidas"
-              >
-                <Zap size={16} />
-              </button>
+                  {/* Followups */}
+                  <div className="rounded-2xl border border-[var(--wa-border)] overflow-hidden">
+                    <div className="px-3 py-2 bg-[var(--wa-header)] text-sm font-semibold">Seguimiento</div>
+                    <div className="p-3">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {([
+                          ["2d", "+2 días"],
+                          ["7d", "+7 días"],
+                          ["15d", "+15 días"],
+                          ["tomorrow10", "Mañana 10:00"],
+                        ] as Array<["2d" | "7d" | "15d" | "tomorrow10", string]>).map(([k, label]) => (
+                          <button
+                            key={k}
+                            type="button"
+                            className="rounded-full border border-[var(--wa-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/5"
+                            onClick={() => addFollowupMut.mutate(dueFromPreset(k))}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <input
+                        className="mt-2 w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                        placeholder="Motivo (opcional)"
+                        value={followupReason}
+                        onChange={(e) => setFollowupReason(e.target.value)}
+                      />
 
-              {qrOpen && conversationId ? (
-                <div className="absolute bottom-[54px] left-0 w-80 max-w-[75vw] rounded-2xl border border-[var(--app-border)] bg-[var(--app-card)] shadow-xl overflow-hidden">
-                  <div className="px-3 py-2 text-xs text-slate-500 dark:text-slate-400 border-b border-[var(--app-border)]">
-                    Respuestas rápidas
+                      <div className="mt-3 space-y-2">
+                        {(followupsQ.data ?? []).filter((f) => f.status === "pending").map((f) => (
+                          <div key={f.id} className="rounded-xl border border-[var(--wa-border)] px-3 py-2">
+                            <div className="text-sm font-medium">
+                              {formatDistanceToNowStrict(new Date(f.due_at), { addSuffix: true })}
+                            </div>
+                            {f.reason ? <div className="text-xs text-[var(--wa-subtext)] mt-0.5">{f.reason}</div> : null}
+                            <div className="mt-2 flex items-center gap-2">
+                              <button
+                                type="button"
+                                className="rounded-full bg-[var(--wa-accent)] text-white px-3 py-1 text-xs hover:opacity-95"
+                                onClick={() => setFollowupStatusMut.mutate({ id: f.id, status: "done" })}
+                              >
+                                Hecho
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-full border border-[var(--wa-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/5"
+                                onClick={() => setFollowupStatusMut.mutate({ id: f.id, status: "canceled" })}
+                              >
+                                Cancelar
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                        {followupsQ.isLoading ? <div className="text-sm text-[var(--wa-subtext)]">Cargando…</div> : null}
+                        {!followupsQ.isLoading && (followupsQ.data ?? []).filter((f) => f.status === "pending").length === 0 ? (
+                          <div className="text-sm text-[var(--wa-subtext)]">Sin recordatorios pendientes.</div>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
-                  <div className="max-h-64 overflow-auto">
-                    {(quickRepliesQ.data ?? []).slice(0, 30).map((r) => (
+
+                  {/* Notes */}
+                  <div className="rounded-2xl border border-[var(--wa-border)] overflow-hidden">
+                    <div className="px-3 py-2 bg-[var(--wa-header)] text-sm font-semibold">Notas</div>
+                    <div className="p-3">
+                      <textarea
+                        className="w-full resize-none rounded-2xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none min-h-[80px]"
+                        placeholder="Anotá datos del cliente, permuta, presupuesto, etc."
+                        value={noteBody}
+                        onChange={(e) => setNoteBody(e.target.value)}
+                      />
                       <button
-                        key={r.id}
                         type="button"
-                        className="w-full text-left px-3 py-2 hover:bg-black/5 dark:hover:bg-white/10"
-                        onClick={() => {
-                          setDraft((prev) => {
-                            const base = prev.trim();
-                            return base ? `${base}\n\n${r.body}` : r.body;
-                          });
-                          setQrOpen(false);
-                          setTimeout(() => composerRef.current?.focus(), 0);
-                        }}
+                        className="mt-2 w-full rounded-xl bg-[var(--wa-accent)] text-white px-4 py-2 text-sm font-semibold hover:opacity-95 disabled:opacity-60"
+                        onClick={() => addNoteMut.mutate()}
+                        disabled={addNoteMut.isPending}
                       >
-                        <div className="text-sm font-semibold truncate">{r.title}</div>
-                        <div className="text-xs text-slate-600 dark:text-slate-300 line-clamp-2 whitespace-pre-wrap">{r.body}</div>
+                        Guardar nota
                       </button>
-                    ))}
-                    {(quickRepliesQ.data ?? []).length === 0 ? (
-                      <div className="px-3 py-3 text-sm text-slate-500">No tenés respuestas rápidas. Crealas en Settings.</div>
-                    ) : null}
+                      {addNoteMut.isError ? <div className="mt-2 text-sm text-red-600">{friendlyError(addNoteMut.error)}</div> : null}
+
+                      <div className="mt-3 space-y-2">
+                        {(notesQ.data ?? []).slice(0, 10).map((n) => (
+                          <div key={n.id} className="rounded-xl border border-[var(--wa-border)] px-3 py-2">
+                            <div className="text-sm whitespace-pre-wrap break-words">{n.body}</div>
+                            <div className="mt-1 text-xs text-[var(--wa-subtext)]">{formatDistanceToNowStrict(new Date(n.created_at), { addSuffix: true })}</div>
+                          </div>
+                        ))}
+                        {notesQ.isLoading ? <div className="text-sm text-[var(--wa-subtext)]">Cargando…</div> : null}
+                        {!notesQ.isLoading && (notesQ.data ?? []).length === 0 ? (
+                          <div className="text-sm text-[var(--wa-subtext)]">No hay notas.</div>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
                 </div>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div className="flex-1 flex items-center justify-center text-[var(--wa-subtext)]">
+            Elegí un chat o creá uno nuevo.
+          </div>
+        )}
+      </div>
+
+      {/* New chat dialog */}
+      <Dialog open={newChatOpen} title="Nuevo chat" onClose={() => setNewChatOpen(false)}>
+        <div className="flex flex-col gap-4">
+          <div>
+            <div className="text-xs text-[var(--wa-subtext)] mb-1">Buscar contacto</div>
+            <input
+              className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+              placeholder="Nombre o teléfono"
+              value={newChatQuery}
+              onChange={(e) => setNewChatQuery(e.target.value)}
+            />
+          </div>
+
+          <div className="rounded-2xl border border-[var(--wa-border)] overflow-hidden">
+            <div className="px-3 py-2 bg-[var(--wa-header)] text-xs font-semibold">Resultados</div>
+            <div className="max-h-56 overflow-auto">
+              {(contactsQ.data ?? []).map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className="w-full text-left px-3 py-3 border-t border-[var(--wa-border)] hover:bg-black/5 dark:hover:bg-white/5"
+                  onClick={() => startChatMut.mutate({ contactId: c.id })}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="h-10 w-10 rounded-full bg-black/5 dark:bg-white/10 inline-flex items-center justify-center">
+                      <User size={18} />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-medium truncate">{c.name || "Sin nombre"}</div>
+                      <div className="text-xs text-[var(--wa-subtext)] truncate">{c.phone_e164}</div>
+                    </div>
+                  </div>
+                </button>
+              ))}
+              {contactsQ.isLoading ? <div className="p-3 text-sm text-[var(--wa-subtext)]">Buscando…</div> : null}
+              {!contactsQ.isLoading && (contactsQ.data ?? []).length === 0 ? (
+                <div className="p-3 text-sm text-[var(--wa-subtext)]">Sin resultados.</div>
               ) : null}
             </div>
+          </div>
 
-            <textarea
-              ref={composerRef}
-              className="flex-1 min-h-[44px] max-h-[140px] rounded-2xl border border-[var(--app-border)] bg-transparent px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-900/20 dark:focus:ring-slate-200/20"
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if ((e as any).isComposing) return;
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (!conversationId) return;
-                  const text = draft.trim();
-                  if (!text) return;
-                  const client_id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-                  setDraft("");
-                  sendTextM.mutate({ text, client_id });
-                }
-              }}
-              placeholder={conversationId ? "Escribí un mensaje..." : "Seleccioná un chat"}
-              disabled={!conversationId}
-            />
-            <button
-              type="submit"
-              disabled={!conversationId || !draft.trim()}
-              className="h-[44px] px-4 rounded-2xl bg-slate-900 text-white dark:bg-slate-200 dark:text-slate-900 text-sm inline-flex items-center gap-2 disabled:opacity-50"
-            >
-              <Send size={16} />
-              Enviar
-            </button>
-          </form>
-
-          {aiOpen && suggestReplyM.isPending ? (
-            <div className="mt-2 text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-2">
-              <Loader2 size={14} className="animate-spin" /> Generando sugerencia…
-            </div>
-          ) : null}
-        </div>
-      </div>
-
-      {/* Right: Details */}
-      <div className="hidden lg:flex w-[360px] border-l border-[var(--app-border)] bg-[var(--app-card)] p-4 flex-col gap-4 overflow-auto">
-        {DetailsInner}
-      </div>
-
-      {isNarrow && detailsOpen ? (
-        <div className="lg:hidden fixed inset-0 z-40">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setDetailsOpen(false)} />
-          <div className="absolute top-0 right-0 h-full w-[360px] max-w-[92vw] bg-[var(--app-card)] border-l border-[var(--app-border)] p-4 overflow-auto flex flex-col gap-4">
-            <div className="flex items-center justify-between">
-              <div className="text-sm font-semibold">Detalles</div>
+          <div className="rounded-2xl border border-[var(--wa-border)] p-3">
+            <div className="text-xs font-semibold mb-2">Crear contacto y abrir chat</div>
+            <div className="grid grid-cols-1 gap-2">
+              <input
+                className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                placeholder="Nombre (opcional)"
+                value={newChatName}
+                onChange={(e) => setNewChatName(e.target.value)}
+              />
+              <input
+                className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                placeholder="Teléfono (ej: +549...)"
+                value={newChatPhone}
+                onChange={(e) => setNewChatPhone(e.target.value)}
+              />
               <button
                 type="button"
-                onClick={() => setDetailsOpen(false)}
-                className="h-10 w-10 rounded-xl border border-[var(--app-border)] hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center"
-                aria-label="Cerrar"
+                className="mt-1 inline-flex items-center justify-center gap-2 rounded-xl bg-[var(--wa-accent)] text-white px-4 py-2 text-sm font-semibold hover:opacity-95 disabled:opacity-60"
+                disabled={!newChatPhone.trim() || createAndStartChatMut.isPending}
+                onClick={() => createAndStartChatMut.mutate()}
               >
-                <X size={18} />
+                {createAndStartChatMut.isPending ? <Loader2 size={18} className="animate-spin" /> : <MessageSquarePlus size={18} />}
+                Abrir chat
               </button>
             </div>
-            {DetailsInner}
+            {createAndStartChatMut.isError ? (
+              <div className="mt-2 text-sm text-red-600">{friendlyError(createAndStartChatMut.error)}</div>
+            ) : null}
           </div>
         </div>
-      ) : null}
-    </div>
-  );
-}
+      </Dialog>
 
-function FollowupComposer({ onAdd }: { onAdd: (due_at: string, reason?: string) => void }) {
-  const [reason, setReason] = React.useState("Seguimiento");
-  const [when, setWhen] = React.useState<"2d" | "7d" | "15d" | "tomorrow10" | "custom">("2d");
-  const [customMinutes, setCustomMinutes] = React.useState(120);
-
-  function computeDueIso() {
-    const now = new Date();
-    if (when === "2d") return new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000).toISOString();
-    if (when === "7d") return new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    if (when === "15d") return new Date(now.getTime() + 15 * 24 * 60 * 60 * 1000).toISOString();
-    if (when === "tomorrow10") {
-      const t = new Date(now);
-      t.setDate(t.getDate() + 1);
-      t.setHours(10, 0, 0, 0);
-      return t.toISOString();
-    }
-    // custom
-    return new Date(now.getTime() + customMinutes * 60 * 1000).toISOString();
-  }
-
-  return (
-    <div className="rounded-2xl border p-3 flex flex-col gap-2">
-      <div className="text-xs text-slate-500">Cuándo</div>
-      <div className="flex flex-wrap gap-2">
-        <Pill active={when === "2d"} onClick={() => setWhen("2d")}>+2 días</Pill>
-        <Pill active={when === "7d"} onClick={() => setWhen("7d")}>+7 días</Pill>
-        <Pill active={when === "15d"} onClick={() => setWhen("15d")}>+15 días</Pill>
-        <Pill active={when === "tomorrow10"} onClick={() => setWhen("tomorrow10")}>Mañana 10:00</Pill>
-        <Pill active={when === "custom"} onClick={() => setWhen("custom")}>Personalizado</Pill>
-      </div>
-
-      {when === "custom" ? (
-        <div className="flex items-center gap-2">
-          <input
-            className="w-24 rounded-xl border px-3 py-2 text-sm"
-            type="number"
-            min={5}
-            value={customMinutes}
-            onChange={(e) => setCustomMinutes(parseInt(e.target.value || "0", 10))}
-          />
-          <div className="text-sm">minutos</div>
-        </div>
-      ) : null}
-
-      <div className="text-xs text-slate-500 mt-1">Motivo</div>
-      <input
-        className="w-full rounded-xl border px-3 py-2 text-sm"
-        value={reason}
-        onChange={(e) => setReason(e.target.value)}
-        placeholder="Motivo"
-      />
-      <button
-        className="rounded-xl bg-slate-900 text-white px-3 py-2 text-sm hover:opacity-95"
-        type="button"
-        onClick={() => onAdd(computeDueIso(), reason)}
+      {/* Quick replies */}
+      <Dialog
+        open={qrPickerOpen}
+        title="Respuestas rápidas"
+        onClose={() => {
+          setQrPickerOpen(false);
+          setQrSearch("");
+        }}
       >
-        Crear recordatorio
-      </button>
+        <div className="flex flex-col gap-3">
+          <input
+            className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+            placeholder="Buscar…"
+            value={qrSearch}
+            onChange={(e) => setQrSearch(e.target.value)}
+          />
+          <div className="max-h-72 overflow-auto rounded-2xl border border-[var(--wa-border)]">
+            {(quickRepliesQ.data ?? [])
+              .filter((r) => {
+                const s = qrSearch.trim().toLowerCase();
+                if (!s) return true;
+                return `${r.title} ${r.body}`.toLowerCase().includes(s);
+              })
+              .map((r) => (
+                <button
+                  key={r.id}
+                  type="button"
+                  className="w-full text-left px-3 py-3 border-t border-[var(--wa-border)] hover:bg-black/5 dark:hover:bg-white/5"
+                  onClick={() => {
+                    setComposer((prev) => (prev ? prev + "\n" : "") + r.body);
+                    setQrPickerOpen(false);
+                    setQrSearch("");
+                  }}
+                >
+                  <div className="font-semibold text-sm">{r.title}</div>
+                  <div className="mt-1 text-xs text-[var(--wa-subtext)] whitespace-pre-wrap break-words">{r.body}</div>
+                </button>
+              ))}
+            {(quickRepliesQ.data ?? []).length === 0 ? (
+              <div className="p-3 text-sm text-[var(--wa-subtext)]">No tenés respuestas rápidas. Crealas en Ajustes.</div>
+            ) : null}
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Templates */}
+      <Dialog
+        open={tplPickerOpen}
+        title="Plantillas de WhatsApp"
+        onClose={() => {
+          setTplPickerOpen(false);
+          setTplSelected(null);
+          setTplVars("");
+        }}
+      >
+        {!tplSelected ? (
+          <div className="max-h-80 overflow-auto rounded-2xl border border-[var(--wa-border)]">
+            {(templatesQ.data ?? []).map((t) => (
+              <button
+                key={t.name}
+                type="button"
+                className="w-full text-left px-3 py-3 border-t border-[var(--wa-border)] hover:bg-black/5 dark:hover:bg-white/5"
+                onClick={() => setTplSelected({ name: t.name, language: t.language || "es_AR" })}
+              >
+                <div className="font-semibold text-sm">{t.name}</div>
+                <div className="mt-1 text-xs text-[var(--wa-subtext)]">{t.language || "es_AR"}</div>
+              </button>
+            ))}
+            {(templatesQ.data ?? []).length === 0 ? (
+              <div className="p-3 text-sm text-[var(--wa-subtext)]">No hay plantillas cargadas. Importalas en Ajustes.</div>
+            ) : null}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            <div className="rounded-2xl border border-[var(--wa-border)] p-3">
+              <div className="text-sm font-semibold">{tplSelected.name}</div>
+              <div className="text-xs text-[var(--wa-subtext)] mt-0.5">Idioma: {tplSelected.language}</div>
+            </div>
+            <div>
+              <div className="text-xs text-[var(--wa-subtext)] mb-1">Variables (separadas por coma, opcional)</div>
+              <input
+                className="w-full rounded-xl border border-[var(--wa-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                placeholder='Ej: "Felipe", "Vento 2015"'
+                value={tplVars}
+                onChange={(e) => setTplVars(e.target.value)}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="rounded-xl border border-[var(--wa-border)] px-4 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/5"
+                onClick={() => setTplSelected(null)}
+              >
+                Volver
+              </button>
+              <button
+                type="button"
+                className="flex-1 rounded-xl bg-[var(--wa-accent)] text-white px-4 py-2 text-sm font-semibold hover:opacity-95 disabled:opacity-60"
+                disabled={sendTemplateMut.isPending}
+                onClick={async () => {
+                  const vars = tplVars
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                    .map((s) => s.replace(/^"|"$/g, ""));
+                  await sendTemplateMut.mutateAsync({ templateName: tplSelected.name, language: tplSelected.language, bodyVars: vars });
+                  setTplPickerOpen(false);
+                  setTplSelected(null);
+                  setTplVars("");
+                }}
+              >
+                {sendTemplateMut.isPending ? "Enviando…" : "Enviar"}
+              </button>
+            </div>
+            {sendTemplateMut.isError ? <div className="text-sm text-red-600">{friendlyError(sendTemplateMut.error)}</div> : null}
+          </div>
+        )}
+      </Dialog>
     </div>
   );
 }

@@ -2,21 +2,44 @@
 @tailwind components;
 @tailwind utilities;
 
+/* WhatsApp Web-ish theme tokens (light + dark) */
 :root {
   color-scheme: light;
-  --app-bg: #f8fafc;
-  --app-fg: #0f172a;
-  --app-card: #ffffff;
-  --app-border: #e2e8f0;
+
+  --wa-accent: #25d366; /* WhatsApp green */
+  --wa-accent-dark: #128c7e;
+  --wa-bg: #f0f2f5; /* app background */
+  --wa-panel: #ffffff; /* list + panels */
+  --wa-header: #f0f2f5; /* headers */
+  --wa-border: #e9edef;
+  --wa-text: #111b21;
+  --wa-subtext: #667781;
+
+  --wa-chat-bg: #efeae2;
+  --wa-bubble-in: #ffffff;
+  --wa-bubble-out: #d9fdd3;
+  --wa-bubble-in-text: #111b21;
+  --wa-bubble-out-text: #111b21;
 }
 
 /* When Tailwind adds the `dark` class to <html>, we switch vars */
 .dark {
   color-scheme: dark;
-  --app-bg: #020617; /* slate-950 */
-  --app-fg: #e2e8f0; /* slate-200 */
-  --app-card: #0b1220;
-  --app-border: #1f2937;
+
+  --wa-accent: #25d366;
+  --wa-accent-dark: #0aa37f;
+  --wa-bg: #0b141a;
+  --wa-panel: #111b21;
+  --wa-header: #202c33;
+  --wa-border: #2a3942;
+  --wa-text: #e9edef;
+  --wa-subtext: #8696a0;
+
+  --wa-chat-bg: #0b141a;
+  --wa-bubble-in: #202c33;
+  --wa-bubble-out: #005c4b;
+  --wa-bubble-in-text: #e9edef;
+  --wa-bubble-out-text: #e9edef;
 }
 
 html, body, #root {
@@ -26,8 +49,8 @@ html, body, #root {
 body {
   margin: 0;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-  background: var(--app-bg);
-  color: var(--app-fg);
+  background: var(--wa-bg);
+  color: var(--wa-text);
 }
 
 * { box-sizing: border-box; }
