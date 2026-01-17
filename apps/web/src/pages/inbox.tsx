@@ -1233,44 +1233,56 @@ export function InboxPage() {
                         </div>
                       ) : null}
 
-                      {(selectedConversation?.ai_meta?.objections || []).length ? (
-                        <div>
-                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Objeciones</div>
-                          <div className="flex flex-wrap gap-2">
-                            {(selectedConversation.ai_meta.objections as any[]).slice(0, 6).map((o, i) => (
-                              <span key={i} className="inline-flex items-center rounded-full bg-black/5 dark:bg-white/10 px-3 py-1 text-xs">
-                                {String(o)}
-                              </span>
-                            ))}
+                      {(() => {
+                        const objections = (selectedConversation?.ai_meta?.objections as any[] | undefined) ?? []
+                        if (!objections.length) return null
+                        return (
+                          <div>
+                            <div className="text-xs text-[var(--wa-subtext)] mb-1">Objeciones</div>
+                            <div className="flex flex-wrap gap-2">
+                              {objections.slice(0, 6).map((o, i) => (
+                                <span key={i} className="inline-flex items-center rounded-full bg-black/5 dark:bg-white/10 px-3 py-1 text-xs">
+                                  {String(o)}
+                                </span>
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      ) : null}
+                        )
+                      })()}
 
-                      {(selectedConversation?.ai_meta?.next_steps || []).length ? (
-                        <div>
-                          <div className="text-xs text-[var(--wa-subtext)] mb-1">Próximos pasos</div>
-                          <ul className="list-disc pl-5 text-sm space-y-1">
-                            {(selectedConversation.ai_meta.next_steps as any[]).slice(0, 6).map((s, i) => (
-                              <li key={i}>{String(s)}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
-
-                      {selectedConversation?.ai_meta?.recommended_stage ? (
-                        <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--wa-border)] px-3 py-2">
-                          <div className="text-sm">
-                            Recomendado: <span className="font-semibold">{STAGE_LABEL[String(selectedConversation.ai_meta.recommended_stage)] || String(selectedConversation.ai_meta.recommended_stage)}</span>
+                      {(() => {
+                        const nextSteps = (selectedConversation?.ai_meta?.next_steps as any[] | undefined) ?? []
+                        if (!nextSteps.length) return null
+                        return (
+                          <div>
+                            <div className="text-xs text-[var(--wa-subtext)] mb-1">Próximos pasos</div>
+                            <ul className="list-disc pl-5 text-sm space-y-1">
+                              {nextSteps.slice(0, 6).map((s, i) => (
+                                <li key={i}>{String(s)}</li>
+                              ))}
+                            </ul>
                           </div>
-                          <button
-                            type="button"
-                            className="rounded-xl bg-[var(--wa-accent)] text-white px-3 py-1.5 text-xs font-semibold hover:opacity-95"
-                            onClick={() => setStageMut.mutate(String(selectedConversation.ai_meta.recommended_stage) as any)}
-                          >
-                            Aplicar
-                          </button>
-                        </div>
-                      ) : null}
+                        )
+                      })()}
+
+                      {(() => {
+                        const recStage = selectedConversation?.ai_meta?.recommended_stage
+                        if (!recStage) return null
+                        return (
+                          <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--wa-border)] px-3 py-2">
+                            <div className="text-sm">
+                              Recomendado: <span className="font-semibold">{STAGE_LABEL[String(recStage)] || String(recStage)}</span>
+                            </div>
+                            <button
+                              type="button"
+                              className="rounded-xl bg-[var(--wa-accent)] text-white px-3 py-1.5 text-xs font-semibold hover:opacity-95"
+                              onClick={() => setStageMut.mutate(String(recStage) as any)}
+                            >
+                              Aplicar
+                            </button>
+                          </div>
+                        )
+                      })()}
                     </div>
                   </div>
 
