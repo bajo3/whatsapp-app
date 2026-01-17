@@ -26,6 +26,8 @@ const env = {
   waVerifyToken: process.env.WHATSAPP_VERIFY_TOKEN || "",
   metaAppSecret: process.env.META_APP_SECRET || "",
   defaultDealershipId: process.env.DEFAULT_DEALERSHIP_ID || "",
+  openaiApiKey: process.env.OPENAI_API_KEY || "",
+  openaiModel: process.env.OPENAI_MODEL || "gpt-5",
 };
 
 if (!env.supabaseUrl || !env.supabaseServiceKey) {
@@ -501,6 +503,85 @@ app.post("/v1/messages/send_flow", authRequired, async (req: AuthedReq, res) => 
 app.post("/v1/templates/sync", authRequired, async (_req: AuthedReq, res) => {
   // Stub: optional endpoint if you later implement Meta template fetch.
   res.json({ ok: true, note: "Not implemented in MVP (leave templates managed in DB)" });
+});
+
+app.post("/v1/ai/suggest_reply", authRequired, async (req: AuthedReq, res) => {
+  try {
+    const body = z
+      .object({ conversation_id: z.string().min(1) })
+      .parse(req.body);
+
+    if (!env.openaiApiKey) {
+      return res.status(501).json({ ok: false, error: "OPENAI_API_KEY not set" });
+    }
+
+    const { data: msgs, error: mErr } = await supabaseAdmin
+      .from("messages")
+      .select("direction, body, created_at")
+      .eq("conversation_id", body.conversation_id)
+      .order("created_at", { ascending: true })
+      .limit(30);
+    if (mErr) throw mErr;
+
+    const { data: conv } = await supabaseAdmin
+      .from("conversations")
+      .select("id, contact_id")
+      .eq("id", body.conversation_id)
+      .maybeSingle();
+
+    let contactLine = "";
+    if (conv?.contact_id) {
+      const { data: contact } = await supabaseAdmin
+        .from("contacts")
+        .select("name, phone_e164")
+        .eq("id", conv.contact_id)
+        .maybeSingle();
+      if (contact) contactLine = `Contacto: ${contact.name || "(sin nombre)"} — ${contact.phone_e164}`;
+    }
+
+    const transcript = (msgs || [])
+      .map((m: any) => {
+        const who = m.direction === "out" ? "Vendedor" : "Cliente";
+        return `${who}: ${String(m.body || "").trim()}`;
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    const prompt = `Sos un vendedor de autos en Argentina y estás respondiendo por WhatsApp.\n\nObjetivo: responder de forma clara, rápida, amable y orientada a cerrar, SIN presionar, y siempre con una pregunta concreta para avanzar (presupuesto, permuta, financiación, disponibilidad, ubicación).\n\nReglas:\n- Máximo 3-5 líneas\n- Español rioplatense\n- No inventes datos que no estén en el chat\n- Si falta info, pedila\n\n${contactLine}\n\nChat:\n${transcript}\n\nEscribí una respuesta sugerida (solo el texto del mensaje).`;
+
+    const { statusCode, body: respBody } = await request("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.openaiApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: env.openaiModel,
+        input: prompt,
+        max_output_tokens: 200,
+      }),
+    });
+
+    const raw = await respBody.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      // ignore
+    }
+
+    if (statusCode < 200 || statusCode >= 300) {
+      return res.status(500).json({ ok: false, error: `OpenAI error ${statusCode}: ${raw}` });
+    }
+
+    const text =
+      (json && (json.output_text || json?.output?.[0]?.content?.[0]?.text)) ||
+      "";
+
+    return res.json({ ok: true, text: String(text).trim() });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || "Bad request" });
+  }
 });
 
 async function resolvePhoneNumberId(dealershipId: string): Promise<string | null> {

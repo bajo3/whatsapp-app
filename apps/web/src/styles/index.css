@@ -4,6 +4,19 @@
 
 :root {
   color-scheme: light;
+  --app-bg: #f8fafc;
+  --app-fg: #0f172a;
+  --app-card: #ffffff;
+  --app-border: #e2e8f0;
+}
+
+/* When Tailwind adds the `dark` class to <html>, we switch vars */
+.dark {
+  color-scheme: dark;
+  --app-bg: #020617; /* slate-950 */
+  --app-fg: #e2e8f0; /* slate-200 */
+  --app-card: #0b1220;
+  --app-border: #1f2937;
 }
 
 html, body, #root {
@@ -13,8 +26,8 @@ html, body, #root {
 body {
   margin: 0;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-  background: #f8fafc;
-  color: #0f172a;
+  background: var(--app-bg);
+  color: var(--app-fg);
 }
 
 * { box-sizing: border-box; }

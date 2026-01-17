@@ -6,21 +6,28 @@ import {
   Bell,
   Check,
   CheckCheck,
+  ChevronLeft,
   Filter,
+  Loader2,
+  MoreVertical,
   Phone,
   Search,
   Send,
+  Sparkles,
   Tag as TagIcon,
   UserPlus,
   X,
   StickyNote,
   Clock,
+  Zap,
 } from "lucide-react";
 
 import { supabase } from "../lib/supabase";
 import { apiPost } from "../lib/api";
 import { useSession } from "../lib/hooks";
 import type { Conversation, Followup, Message, ProfileMini, Tag } from "../lib/types";
+
+type QuickReply = { id: string; title: string; body: string };
 
 type Note = {
   id: string;
@@ -104,6 +111,24 @@ async function fetchTags(): Promise<Tag[]> {
   const { data, error } = await supabase.from("tags").select("id,name").order("name", { ascending: true });
   if (error) throw error;
   return (data ?? []) as any;
+}
+
+async function fetchQuickReplies(): Promise<QuickReply[]> {
+  const { data, error } = await supabase.from("quick_replies").select("id,title,body").order("title", { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as any;
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = React.useState(false);
+  React.useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = () => setMatches(mq.matches);
+    onChange();
+    mq.addEventListener?.("change", onChange);
+    return () => mq.removeEventListener?.("change", onChange);
+  }, [query]);
+  return matches;
 }
 
 async function fetchConversationTags(conversationId: string): Promise<string[]> {
@@ -204,9 +229,20 @@ export function InboxPage() {
   const [sp, setSp] = useSearchParams();
   const conversationId = sp.get("c") || null;
 
+  // Responsive helpers
+  const isSmall = useMediaQuery("(max-width: 767px)");
+  const isNarrow = useMediaQuery("(max-width: 1023px)");
+
+  React.useEffect(() => {
+    if (!isNarrow) setDetailsOpen(false);
+  }, [isNarrow]);
+
   // UI state
   const [search, setSearch] = React.useState("");
   const [filter, setFilter] = React.useState<"all" | "mine" | "unassigned" | "unread">("all");
+  const [detailsOpen, setDetailsOpen] = React.useState(false);
+  const [qrOpen, setQrOpen] = React.useState(false);
+  const [aiOpen, setAiOpen] = React.useState(false);
 
   // --- Queries ---
   const convQ = useQuery({
@@ -217,6 +253,7 @@ export function InboxPage() {
   });
   const profilesQ = useQuery({ queryKey: ["profiles"], queryFn: fetchProfiles });
   const tagsQ = useQuery({ queryKey: ["tags"], queryFn: fetchTags });
+  const quickRepliesQ = useQuery({ queryKey: ["quick_replies"], queryFn: fetchQuickReplies });
   const dueFupsQ = useQuery({
     queryKey: ["due_followups"],
     queryFn: fetchDueFollowups,
@@ -547,6 +584,21 @@ export function InboxPage() {
   // --- Chat composer ---
   const [draft, setDraft] = React.useState("");
   const [noteDraft, setNoteDraft] = React.useState("");
+  const composerRef = React.useRef<HTMLTextAreaElement | null>(null);
+
+  const suggestReplyM = useMutation({
+    mutationFn: async () => {
+      if (!conversationId) throw new Error("No conversation");
+      return apiPost<{ ok: boolean; text?: string }>("/v1/ai/suggest_reply", { conversation_id: conversationId });
+    },
+    onSuccess: (d) => {
+      if (d?.text) {
+        setDraft(d.text);
+        // scroll will happen on send; no need here
+      }
+      setAiOpen(false);
+    },
+  });
 
   function openConversation(id: string) {
     setSp({ c: id });
@@ -561,11 +613,170 @@ export function InboxPage() {
   const headerName = activeConv ? activeConv.contact?.name || activeConv.contact?.phone_e164 || "Sin nombre" : "Seleccioná una conversación";
   const headerPhone = activeConv ? activeConv.contact?.phone_e164 : "";
 
+  const DetailsInner = (
+    !conversationId ? (
+      <div className="text-sm text-slate-500 dark:text-slate-400">Detalles</div>
+    ) : (
+      <>
+        <div className="flex flex-col gap-2">
+          <SectionTitle icon={<UserPlus size={14} />} title="Asignación" />
+          <select
+            className="w-full rounded-xl border border-[var(--app-border)] bg-transparent px-3 py-2 text-sm"
+            value={activeConv?.assigned_to ?? ""}
+            onChange={(e) => updateAssigneeM.mutate(e.target.value ? e.target.value : null)}
+          >
+            <option value="">Sin asignar</option>
+            {(profilesQ.data ?? []).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.full_name || p.id.slice(0, 8)} ({p.role})
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <SectionTitle icon={<TagIcon size={14} />} title="Etiquetas" />
+          <div className="flex flex-wrap gap-2">
+            {(tagsQ.data ?? []).map((t) => {
+              const on = (convTagsQ.data ?? []).includes(t.id);
+              return (
+                <button
+                  key={t.id}
+                  className={`rounded-full border border-[var(--app-border)] px-3 py-1 text-xs transition ${
+                    on
+                      ? "bg-slate-900 text-white dark:bg-slate-200 dark:text-slate-900"
+                      : "bg-[var(--app-card)] hover:bg-black/5 dark:hover:bg-white/10"
+                  }`}
+                  onClick={() => toggleTagM.mutate(t.id)}
+                  type="button"
+                >
+                  {t.name}
+                </button>
+              );
+            })}
+            {(tagsQ.data ?? []).length === 0 ? (
+              <span className="text-xs text-slate-500 dark:text-slate-400">Creá tags en Settings</span>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <SectionTitle icon={<Bell size={14} />} title="Recordatorios" />
+          <FollowupComposer onAdd={(due_at, reason) => addFollowupM.mutate({ due_at, reason })} />
+
+          <div className="flex flex-col gap-2">
+            {(followupsQ.data ?? []).map((f) => {
+              const overdue = f.status === "pending" && new Date(f.due_at).getTime() <= Date.now();
+              return (
+                <div
+                  key={f.id}
+                  className={`rounded-2xl border border-[var(--app-border)] p-3 ${
+                    overdue ? "border-amber-300 bg-amber-50 dark:bg-amber-950/20" : "bg-transparent"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <div className="text-sm font-medium">{new Date(f.due_at).toLocaleString()}</div>
+                      <div className="text-xs text-slate-600 dark:text-slate-300 mt-1">{f.reason || "(sin motivo)"}</div>
+                      <div className="text-xs mt-2">
+                        Estado: <span className="font-medium">{f.status}</span>
+                        {overdue ? <span className="ml-2 font-semibold text-amber-700 dark:text-amber-300">VENCIDO</span> : null}
+                      </div>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      {f.status === "pending" ? (
+                        <>
+                          <button
+                            className="rounded-xl border border-[var(--app-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/10"
+                            type="button"
+                            onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "done" })}
+                          >
+                            Hecho
+                          </button>
+                          <button
+                            className="rounded-xl border border-[var(--app-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/10"
+                            type="button"
+                            onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "canceled" })}
+                          >
+                            Cancelar
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="rounded-xl border border-[var(--app-border)] px-3 py-1 text-xs hover:bg-black/5 dark:hover:bg-white/10"
+                          type="button"
+                          onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "pending" })}
+                        >
+                          Reabrir
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {(followupsQ.data ?? []).length === 0 ? (
+              <span className="text-xs text-slate-500 dark:text-slate-400">No hay recordatorios</span>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <SectionTitle icon={<StickyNote size={14} />} title="Notas internas" />
+          <div className="rounded-2xl border border-[var(--app-border)] p-3">
+            <textarea
+              className="w-full min-h-[70px] rounded-xl border border-[var(--app-border)] bg-transparent px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-900/20 dark:focus:ring-slate-200/20"
+              placeholder="Ej: Le interesa Vento/Corolla, presupuesto 12M, quiere permuta…"
+              value={noteDraft}
+              onChange={(e) => setNoteDraft(e.target.value)}
+            />
+            <button
+              className="mt-2 rounded-xl bg-slate-900 text-white dark:bg-slate-200 dark:text-slate-900 px-3 py-2 text-sm hover:opacity-95 disabled:opacity-50"
+              disabled={!noteDraft.trim() || addNoteM.isPending}
+              type="button"
+              onClick={() => {
+                const body = noteDraft.trim();
+                if (!body) return;
+                setNoteDraft("");
+                addNoteM.mutate(body);
+              }}
+            >
+              Guardar nota
+            </button>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            {(notesQ.data ?? []).map((n) => (
+              <div key={n.id} className="rounded-2xl border border-[var(--app-border)] p-3">
+                <div className="text-xs text-slate-500 dark:text-slate-400">{new Date(n.created_at).toLocaleString()}</div>
+                <div className="mt-1 text-sm whitespace-pre-wrap break-words">{n.body}</div>
+              </div>
+            ))}
+            {(notesQ.data ?? []).length === 0 ? (
+              <span className="text-xs text-slate-500 dark:text-slate-400">No hay notas</span>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-[var(--app-border)] p-3 text-xs text-slate-600 dark:text-slate-300">
+          <div className="font-semibold text-slate-800 dark:text-slate-100">Checklist anti-perdida de leads</div>
+          <div className="mt-1">
+            • Asignate el lead apenas entra • Programá seguimiento (+2 / +7 / +15 días) • Dejá nota de intención y presupuesto.
+          </div>
+        </div>
+      </>
+    )
+  );
+
   return (
-    <div className="h-full w-full flex bg-slate-50">
+    <div className="h-full w-full flex flex-col md:flex-row bg-[var(--app-bg)]">
       {/* Left: Inbox */}
-      <div className="w-[360px] border-r bg-white flex flex-col min-w-0">
-        <div className="p-4 border-b">
+      <div
+        className={`w-full md:w-[360px] border-r border-[var(--app-border)] bg-[var(--app-card)] flex flex-col min-w-0 ${
+          isSmall && conversationId ? "hidden" : "flex"
+        }`}
+      >
+        <div className="p-4 border-b border-[var(--app-border)]">
           <div className="flex items-center justify-between">
             <div>
               <div className="text-sm font-semibold">Inbox</div>
@@ -577,10 +788,10 @@ export function InboxPage() {
             </div>
           </div>
 
-          <div className="mt-3 flex items-center gap-2 rounded-2xl border px-3 py-2">
+          <div className="mt-3 flex items-center gap-2 rounded-2xl border border-[var(--app-border)] px-3 py-2">
             <Search size={16} className="text-slate-500" />
             <input
-              className="w-full text-sm outline-none"
+              className="w-full text-sm outline-none bg-transparent"
               placeholder="Buscar por nombre o teléfono"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
@@ -603,7 +814,7 @@ export function InboxPage() {
         </div>
 
         {/* Reminders / Follow-ups vencidos */}
-        <div className="border-b bg-white p-3">
+        <div className="border-b border-[var(--app-border)] bg-[var(--app-card)] p-3">
           <SectionTitle
             icon={<Clock size={14} />}
             title="Recordatorios vencidos"
@@ -686,18 +897,47 @@ export function InboxPage() {
       </div>
 
       {/* Middle: Chat */}
-      <div className="flex-1 min-w-0 flex flex-col">
-        <div className="h-14 border-b bg-white px-4 flex items-center justify-between">
+      <div className={`flex-1 min-w-0 flex flex-col ${isSmall && !conversationId ? "hidden" : "flex"}`}>
+        <div className="h-14 border-b border-[var(--app-border)] bg-[var(--app-card)] px-2 md:px-4 flex items-center justify-between gap-2">
           <div className="min-w-0">
-            <div className="text-sm font-semibold truncate">{headerName}</div>
-            <div className="text-xs text-slate-500 truncate">{headerPhone}</div>
+            <div className="flex items-center gap-2 min-w-0">
+              {isSmall ? (
+                <button
+                  type="button"
+                  className="h-10 w-10 rounded-xl hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center"
+                  onClick={() => setSp((p) => {
+                    p.delete("c");
+                    return p;
+                  })}
+                  aria-label="Volver"
+                >
+                  <ChevronLeft size={20} />
+                </button>
+              ) : null}
+
+              <div className="min-w-0">
+                <div className="text-sm font-semibold truncate">{headerName}</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400 truncate">{headerPhone}</div>
+              </div>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             {conversationId ? (
               <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAiOpen(true);
+                    suggestReplyM.mutate();
+                  }}
+                  className="rounded-xl border border-[var(--app-border)] px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center gap-2"
+                >
+                  {suggestReplyM.isPending ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+                  IA
+                </button>
                 <a
                   href={headerPhone ? `tel:${headerPhone.replace(/\s/g, "")}` : "#"}
-                  className={`rounded-xl border px-3 py-2 text-xs hover:bg-slate-50 inline-flex items-center gap-2 ${
+                  className={`rounded-xl border border-[var(--app-border)] px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center gap-2 ${
                     headerPhone ? "" : "pointer-events-none opacity-50"
                   }`}
                 >
@@ -706,12 +946,22 @@ export function InboxPage() {
                 </a>
                 <button
                   onClick={() => assignToMeM.mutate()}
-                  className="rounded-xl border px-3 py-2 text-xs hover:bg-slate-50 inline-flex items-center gap-2"
+                  className="rounded-xl border border-[var(--app-border)] px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center gap-2"
                   type="button"
                 >
                   <UserPlus size={16} />
                   Asignarme
                 </button>
+                {isNarrow ? (
+                  <button
+                    type="button"
+                    onClick={() => setDetailsOpen(true)}
+                    className="h-10 w-10 rounded-xl border hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center"
+                    aria-label="Detalles"
+                  >
+                    <MoreVertical size={18} />
+                  </button>
+                ) : null}
               </>
             ) : null}
           </div>
@@ -769,7 +1019,7 @@ export function InboxPage() {
           )}
         </div>
 
-        <div className="border-t bg-white p-3">
+        <div className="border-t border-[var(--app-border)] bg-[var(--app-card)] p-3">
           <form
             className="flex items-end gap-2"
             onSubmit={(e) => {
@@ -782,169 +1032,111 @@ export function InboxPage() {
               sendTextM.mutate({ text, client_id });
             }}
           >
+            <div className="relative">
+              <button
+                type="button"
+                disabled={!conversationId}
+                onClick={() => setQrOpen((v) => !v)}
+                className="h-[44px] w-[44px] rounded-2xl border border-[var(--app-border)] hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center disabled:opacity-50"
+                aria-label="Respuestas rápidas"
+              >
+                <Zap size={16} />
+              </button>
+
+              {qrOpen && conversationId ? (
+                <div className="absolute bottom-[54px] left-0 w-80 max-w-[75vw] rounded-2xl border border-[var(--app-border)] bg-[var(--app-card)] shadow-xl overflow-hidden">
+                  <div className="px-3 py-2 text-xs text-slate-500 dark:text-slate-400 border-b border-[var(--app-border)]">
+                    Respuestas rápidas
+                  </div>
+                  <div className="max-h-64 overflow-auto">
+                    {(quickRepliesQ.data ?? []).slice(0, 30).map((r) => (
+                      <button
+                        key={r.id}
+                        type="button"
+                        className="w-full text-left px-3 py-2 hover:bg-black/5 dark:hover:bg-white/10"
+                        onClick={() => {
+                          setDraft((prev) => {
+                            const base = prev.trim();
+                            return base ? `${base}\n\n${r.body}` : r.body;
+                          });
+                          setQrOpen(false);
+                          setTimeout(() => composerRef.current?.focus(), 0);
+                        }}
+                      >
+                        <div className="text-sm font-semibold truncate">{r.title}</div>
+                        <div className="text-xs text-slate-600 dark:text-slate-300 line-clamp-2 whitespace-pre-wrap">{r.body}</div>
+                      </button>
+                    ))}
+                    {(quickRepliesQ.data ?? []).length === 0 ? (
+                      <div className="px-3 py-3 text-sm text-slate-500">No tenés respuestas rápidas. Crealas en Settings.</div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
             <textarea
-              className="flex-1 min-h-[44px] max-h-[140px] rounded-2xl border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-900/20"
+              ref={composerRef}
+              className="flex-1 min-h-[44px] max-h-[140px] rounded-2xl border border-[var(--app-border)] bg-transparent px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-900/20 dark:focus:ring-slate-200/20"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e as any).isComposing) return;
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!conversationId) return;
+                  const text = draft.trim();
+                  if (!text) return;
+                  const client_id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+                  setDraft("");
+                  sendTextM.mutate({ text, client_id });
+                }
+              }}
               placeholder={conversationId ? "Escribí un mensaje..." : "Seleccioná un chat"}
               disabled={!conversationId}
             />
             <button
               type="submit"
               disabled={!conversationId || !draft.trim()}
-              className="h-[44px] px-4 rounded-2xl bg-slate-900 text-white text-sm inline-flex items-center gap-2 disabled:opacity-50"
+              className="h-[44px] px-4 rounded-2xl bg-slate-900 text-white dark:bg-slate-200 dark:text-slate-900 text-sm inline-flex items-center gap-2 disabled:opacity-50"
             >
               <Send size={16} />
               Enviar
             </button>
           </form>
+
+          {aiOpen && suggestReplyM.isPending ? (
+            <div className="mt-2 text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-2">
+              <Loader2 size={14} className="animate-spin" /> Generando sugerencia…
+            </div>
+          ) : null}
         </div>
       </div>
 
       {/* Right: Details */}
-      <div className="w-[360px] border-l bg-white p-4 flex flex-col gap-4 overflow-auto">
-        {!conversationId ? (
-          <div className="text-sm text-slate-500">Detalles</div>
-        ) : (
-          <>
-            <div className="flex flex-col gap-2">
-              <SectionTitle icon={<UserPlus size={14} />} title="Asignación" />
-              <select
-                className="w-full rounded-xl border px-3 py-2 text-sm"
-                value={activeConv?.assigned_to ?? ""}
-                onChange={(e) => updateAssigneeM.mutate(e.target.value ? e.target.value : null)}
-              >
-                <option value="">Sin asignar</option>
-                {(profilesQ.data ?? []).map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.full_name || p.id.slice(0, 8)} ({p.role})
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <SectionTitle icon={<TagIcon size={14} />} title="Etiquetas" />
-              <div className="flex flex-wrap gap-2">
-                {(tagsQ.data ?? []).map((t) => {
-                  const on = (convTagsQ.data ?? []).includes(t.id);
-                  return (
-                    <button
-                      key={t.id}
-                      className={`rounded-full border px-3 py-1 text-xs ${on ? "bg-slate-900 text-white border-slate-900" : "bg-white hover:bg-slate-50"}`}
-                      onClick={() => toggleTagM.mutate(t.id)}
-                      type="button"
-                    >
-                      {t.name}
-                    </button>
-                  );
-                })}
-                {(tagsQ.data ?? []).length === 0 ? (
-                  <span className="text-xs text-slate-500">Creá tags en Settings</span>
-                ) : null}
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <SectionTitle icon={<Bell size={14} />} title="Recordatorios" />
-              <FollowupComposer
-                onAdd={(due_at, reason) => addFollowupM.mutate({ due_at, reason })}
-              />
-
-              <div className="flex flex-col gap-2">
-                {(followupsQ.data ?? []).map((f) => {
-                  const overdue = f.status === "pending" && new Date(f.due_at).getTime() <= Date.now();
-                  return (
-                    <div key={f.id} className={`rounded-2xl border p-3 ${overdue ? "border-amber-300 bg-amber-50" : ""}`}>
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <div className="text-sm font-medium">{new Date(f.due_at).toLocaleString()}</div>
-                          <div className="text-xs text-slate-600 mt-1">{f.reason || "(sin motivo)"}</div>
-                          <div className="text-xs mt-2">
-                            Estado: <span className="font-medium">{f.status}</span>
-                            {overdue ? <span className="ml-2 font-semibold text-amber-700">VENCIDO</span> : null}
-                          </div>
-                        </div>
-                        <div className="flex flex-col gap-2">
-                          {f.status === "pending" ? (
-                            <>
-                              <button
-                                className="rounded-xl border px-3 py-1 text-xs hover:bg-white"
-                                type="button"
-                                onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "done" })}
-                              >
-                                Hecho
-                              </button>
-                              <button
-                                className="rounded-xl border px-3 py-1 text-xs hover:bg-white"
-                                type="button"
-                                onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "canceled" })}
-                              >
-                                Cancelar
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              className="rounded-xl border px-3 py-1 text-xs hover:bg-slate-50"
-                              type="button"
-                              onClick={() => updateFollowupStatusM.mutate({ id: f.id, status: "pending" })}
-                            >
-                              Reabrir
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-                {(followupsQ.data ?? []).length === 0 ? <span className="text-xs text-slate-500">No hay recordatorios</span> : null}
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <SectionTitle icon={<StickyNote size={14} />} title="Notas internas" />
-              <div className="rounded-2xl border p-3">
-                <textarea
-                  className="w-full min-h-[70px] rounded-xl border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-900/20"
-                  placeholder="Ej: Le interesa Vento/Corolla, presupuesto 12M, quiere permuta…"
-                  value={noteDraft}
-                  onChange={(e) => setNoteDraft(e.target.value)}
-                />
-                <button
-                  className="mt-2 rounded-xl bg-slate-900 text-white px-3 py-2 text-sm hover:opacity-95 disabled:opacity-50"
-                  disabled={!noteDraft.trim() || addNoteM.isPending}
-                  type="button"
-                  onClick={() => {
-                    const body = noteDraft.trim();
-                    if (!body) return;
-                    setNoteDraft("");
-                    addNoteM.mutate(body);
-                  }}
-                >
-                  Guardar nota
-                </button>
-              </div>
-
-              <div className="flex flex-col gap-2">
-                {(notesQ.data ?? []).map((n) => (
-                  <div key={n.id} className="rounded-2xl border p-3">
-                    <div className="text-xs text-slate-500">{new Date(n.created_at).toLocaleString()}</div>
-                    <div className="mt-1 text-sm whitespace-pre-wrap break-words">{n.body}</div>
-                  </div>
-                ))}
-                {(notesQ.data ?? []).length === 0 ? <span className="text-xs text-slate-500">No hay notas</span> : null}
-              </div>
-            </div>
-
-            <div className="rounded-2xl border p-3 text-xs text-slate-600">
-              <div className="font-semibold text-slate-800">Atajos útiles</div>
-              <div className="mt-1">
-                • Asignate el lead apenas entra • Poné un recordatorio (+2 / +7 / +15 días) • Dejá nota de intención y presupuesto.
-              </div>
-            </div>
-          </>
-        )}
+      <div className="hidden lg:flex w-[360px] border-l border-[var(--app-border)] bg-[var(--app-card)] p-4 flex-col gap-4 overflow-auto">
+        {DetailsInner}
       </div>
+
+      {isNarrow && detailsOpen ? (
+        <div className="lg:hidden fixed inset-0 z-40">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setDetailsOpen(false)} />
+          <div className="absolute top-0 right-0 h-full w-[360px] max-w-[92vw] bg-[var(--app-card)] border-l border-[var(--app-border)] p-4 overflow-auto flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-semibold">Detalles</div>
+              <button
+                type="button"
+                onClick={() => setDetailsOpen(false)}
+                className="h-10 w-10 rounded-xl border border-[var(--app-border)] hover:bg-black/5 dark:hover:bg-white/10 inline-flex items-center justify-center"
+                aria-label="Cerrar"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            {DetailsInner}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
